@@ -89,6 +89,7 @@ class Postprocessor:
         # update the model prediction dict
         return postp_beat, postp_downbeat
 
+
     def postp_minimal(self, beat, downbeat, padding_mask):
         # concatenate beat and downbeat in the same tensor of shape (B, T, 2)
         packed_pred = rearrange(
@@ -117,6 +118,7 @@ class Postprocessor:
             )
         return postp_beat, postp_downbeat
 
+
     def _postp_minimal_item(self, padded_beat_peaks, padded_downbeat_peaks, mask):
         """Function to compute the operations that must be computed piece by piece, and cannot be done in batch."""
         # unpad the predictions by truncating the padding positions
@@ -142,6 +144,7 @@ class Postprocessor:
         downbeat_time = np.unique(downbeat_time)
         return beat_time, downbeat_time
 
+
     def postp_dbn(self, beat, downbeat, padding_mask):
         beat_prob = beat.double().sigmoid()
         downbeat_prob = downbeat.double().sigmoid()
@@ -156,6 +159,7 @@ class Postprocessor:
                 )
             )
         return postp_beat, postp_downbeat
+
 
     def _postp_dbn_item(self, padded_beat_prob, padded_downbeat_prob, mask):
         """Function to compute the operations that must be computed piece by piece, and cannot be done in batch."""
@@ -179,6 +183,7 @@ class Postprocessor:
         postp_downbeat = dbn_out[dbn_out[:, 1] == 1][:, 0]
         return postp_beat, postp_downbeat
 
+
     def no_postprocessing(self, beat, downbeat, padding_mask):
         """ Does no real postprocessing, just returns the times, where the beat/downbeat prediction is over 0.5 """
         # Ensure batched shape
@@ -196,6 +201,7 @@ class Postprocessor:
             postp_beat.append(beat_frames / self.fps)
             postp_downbeat.append(downbeat_frames / self.fps)
         return tuple(postp_beat), tuple(postp_downbeat)
+
 
     def causal_thresholding(self, beat, downbeat, threshold=1.75, cooldown=5):
         """ Simple causal thresholding: a beat/downbeat is detected if the activation is above threshold, but there is
@@ -235,6 +241,7 @@ class Postprocessor:
             postp_downbeat.append(np.array(down_times, dtype=np.float32))
 
         return tuple(postp_beat), tuple(postp_downbeat)
+
 
     def shifted_causal_local_max(self, beat, downbeat, threshold=1, shift=3, cooldown=5, db_anywhere=True):
         """ Causal local max detection with a shift/lookahead of `shift` frames. Makes use of the fact that shifted
@@ -279,7 +286,7 @@ class Postprocessor:
                 if len(winB) < win_len:
                     continue
 
-                # Center-only local max for BEAT at τ = t
+                # center-only local max for BEAT at τ = t
                 cB = winB[center_idx]
                 leftB = winB[:center_idx]
                 rightB = winB[center_idx + 1:]

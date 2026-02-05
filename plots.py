@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from beat_this.inference import load_model
 
+
 def plot_gradients_over_time(
         checkpoint_path = str,
         input_tensor = torch.Tensor,
@@ -71,6 +72,7 @@ def plot_gradients_over_time(
     plt.grid()
     plt.show()
 
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     checkpoint_path = "small0"
@@ -81,11 +83,6 @@ if __name__ == "__main__":
 
     input_tensor = torch.randn(1, 1500, 128, requires_grad=True, device='cuda')
     chosen_frame = 750
-
-    #from beat_this.preprocessing import load_audio
-    #real_audio, sr = load_audio("tests/It Don't Mean A Thing - Kings of Swing.mp3")
-    #print("real_audio shape:", real_audio.shape)
-    #print("real_audio type:", type(real_audio))
 
     custom_model_name = "small0"
     #custom_model_name = "full_attn + causal_conv"

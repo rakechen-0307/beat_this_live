@@ -117,6 +117,7 @@ class PLBeatThis(LightningModule):
         self.eval_trim_beats = eval_trim_beats
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
+
     def _compute_loss(self, batch, model_prediction):
         beat_mask = batch["padding_mask"]
         beat_loss = self.beat_loss(
@@ -134,6 +135,7 @@ class PLBeatThis(LightningModule):
             "total": beat_loss + downbeat_loss,
         }
 
+
     def _compute_metrics(self, batch, postp_beat, postp_downbeat, step="val"):
         """ """
         # compute for beat
@@ -149,6 +151,7 @@ class PLBeatThis(LightningModule):
         metrics = {**metrics_beat, **metrics_downbeat}
 
         return metrics
+
 
     def _compute_metrics_target(self, batch, postp_target, target, step):
 
@@ -177,6 +180,7 @@ class PLBeatThis(LightningModule):
                 piece_metrics[f"segment_{seg}"] = seg_metrics
             return piece_metrics
 
+
         def compute_item(pospt_pred, truth_orig_target):
             # take the ground truth from the original version, so there are no quantization errors
             piece_truth_time = np.frombuffer(truth_orig_target)
@@ -184,6 +188,7 @@ class PLBeatThis(LightningModule):
             # run evaluation
             metrics = self.metrics(piece_truth_time, pospt_pred, step=step)
             return metrics
+
 
         # if the input was not batched, postp_target is an array instead of a tuple of arrays
         # make it a tuple for consistency
@@ -222,12 +227,14 @@ class PLBeatThis(LightningModule):
             }
             return batch_metric
 
+
     @staticmethod
     def shift_predictions(pred_times, label_shift, fps):
         """ Shift prediction times by -label_shift frames to correctly calculate metrics. """
         if isinstance(pred_times, tuple):
             return tuple(PLBeatThis.shift_predictions(x, label_shift, fps) for x in pred_times)
         return pred_times - (label_shift / fps)
+
 
     def log_losses(self, losses, batch_size, step="train"):
         # log for separate targets
@@ -293,12 +300,14 @@ class PLBeatThis(LightningModule):
         self.log_losses(losses, len(batch["spect"]), "val")
         self.log_metrics(metrics, batch["spect"].shape[0], "val")
 
+
     def test_step(self, batch, batch_idx):
         metrics, model_prediction, _, _ = self.predict_step(batch, batch_idx)
         losses = self._compute_loss(batch, model_prediction)
         # log
         self.log_losses(losses, len(batch["spect"]), "test")
         self.log_metrics(metrics, batch["spect"].shape[0], "test")
+
 
     def predict_step(
         self,
@@ -309,7 +318,7 @@ class PLBeatThis(LightningModule):
         overlap_mode: str = "keep_first",
     ) -> Any:
         """
-        Compute predictions and metrics for a batch (a dictionary with an "spect" key).
+        Compute predictions and metrics for a batch (a dictionary with a "spect" key).
         It splits up the audio into multiple chunks of chunk size,
          which should correspond to the length of the sequence the model was trained with.
         Potential overlaps between chunks can be handled in two ways:
@@ -393,10 +402,12 @@ class PLBeatThis(LightningModule):
         result["lr_scheduler"] = {"scheduler": self.lr_scheduler, "interval": "step"}
         return result
 
+
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         # remove _orig_mod prefixes for compiled models
         state_dict = replace_state_dict_key(state_dict, "_orig_mod.", "")
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
 
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
@@ -432,6 +443,7 @@ class Metrics:
             return {"F-measure": fmeasure, "Cemgil": cemgil, "CMLt": CMLt, "AMLt": AMLt, "Precision": precision, "Recall": recall}
         else:
             raise ValueError("step must be either val or test")
+
 
     @staticmethod
     def _calc_precision_and_recall(ref, est, window=0.07):

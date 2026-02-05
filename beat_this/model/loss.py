@@ -1,7 +1,3 @@
-"""
-Loss definitions for the Beat This! beat tracker.
-"""
-
 import torch
 import torch.nn.functional as F
 
