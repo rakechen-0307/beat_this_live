@@ -6,6 +6,10 @@ import torchaudio
 def load_audio(path, dtype="float64"):
     try:
         waveform, samplerate = torchaudio.load(path, channels_first=False)
+
+        if waveform.ndim == 2:
+            waveform = waveform.mean(axis=-1)  # mix down to mono
+
         waveform = np.asanyarray(waveform.squeeze().numpy(), dtype=dtype)
         return waveform, samplerate
     except Exception:

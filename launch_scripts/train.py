@@ -20,11 +20,6 @@ def main(args):
     params_str = f"{'noval ' if not args.val else ''}{'hung ' if args.hung_data else ''}{'fold' + str(args.fold) + ' ' if args.fold is not None else ''}{args.loss}-h{args.transformer_dim}-aug{args.tempo_augmentation}{args.pitch_augmentation}{args.mask_augmentation}{' nosumH ' if not args.sum_head else ''}{' nopartialT ' if not args.partial_transformers else ''}{'ct=1 ' if args.causal_transformer else 'ct=0 '}{'cc=1 ' if args.causal_convolution else 'cc=0 '}{'sw' if args.sw_attention_window_size else ''}{args.sw_attention_window_size if args.sw_attention_window_size else ''}{' shifted' if args.label_shift else ''}{args.label_shift if args.label_shift else ''}"
 
     if args.logger == "wandb":
-        # TO BE CHECKED
-        if args.resume_checkpoint and args.resume_id:
-            wandb_args = dict(id=args.resume_id, resume="must")
-        else:
-            wandb_args = {}
         logger = WandbLogger(
             project="beat_this", name=f"{args.name} {params_str}".strip()
         )
@@ -103,6 +98,7 @@ def main(args):
         causal_transformer=args.causal_transformer,
         causal_convolution=args.causal_convolution,
         sw_attention_window_size=args.sw_attention_window_size,
+        causal_inference=args.causal_inference,
         label_shift=args.label_shift,
     )
     for part in args.compile:
@@ -135,11 +131,7 @@ def main(args):
         check_val_every_n_epoch=args.val_frequency,
     )
 
-    # resume-from-checkpoint work
-    if args.resume_checkpoint:
-        trainer.fit(pl_model, datamodule, ckpt_path=args.resume_checkpoint)
-    else:
-        trainer.fit(pl_model, datamodule)
+    trainer.fit(pl_model, datamodule)
 
     trainer.test(pl_model, datamodule)
 
@@ -288,18 +280,6 @@ if __name__ == "__main__":
         help="Seed for the random number generators.",
     )
     parser.add_argument(
-        "--resume-checkpoint",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume training."
-    )
-    parser.add_argument(
-        "--resume-id",
-        type=str,
-        default="",
-        help="Optional wandb id to continue logging to."
-    )
-    parser.add_argument(
         "--causal-transformer",
         default=False,
         action=argparse.BooleanOptionalAction,
@@ -316,6 +296,13 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Window size for the sliding window attention in frames. If 0, no sliding window attention is used."
+    )
+    parser.add_argument(
+        "--causal-inference",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Sets the postprocessing logic to causal. During training, this only determines the metrics calculated"
+             "during the validation step, but has no effect on training outcome."
     )
     parser.add_argument(
         "--label-shift",

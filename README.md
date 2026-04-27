@@ -6,6 +6,45 @@ by Francesco Foscarin, Jan Schlüter and Gerhard Widmer.
 
 The original repository is available [here](https://github.com/CPJKU/beat_this/tree/main).
 
+## Compute metrics
+
+To compute metrics from the thesis, checkpoints have to be downloaded from here (ADD LINK). Then, provided that the
+requirements have been installed, the following command will calculate all metrics:
+
+```
+python launch_scripts/compute_paper_metrics.py
+--model <relative path to checkpoint file>
+--datasplit <either 'valid' or 'test'>
+--causal_inference
+```
+
+Using the `--segment_metrics` flag, the segmented metrics can be computed (this only makes sense on the test set).
+
+To perform the ablation studies presented in the thesis, where causal models were evaluated using offline
+postprocessing, use the `--minimal_postprocessing` flag. (Combining this flag with `--causal_inference` will throw an
+error.)
+
+
+## Training
+
+To train a model, the following command can be used to recreate the best model in the thesis:
+
+```
+python launch_scripts/train.py
+--seed=0
+--transformer-dim=128
+--causal-transformer
+--causal-convolution
+--sw-attention-window-size=256
+--label-shift=-3
+--causal_inference
+```
+
+This will result in training a fully causal model (with causal convolutions and attention) with the labels shifted back
+by 3 frames. `--causal_inference` only affects the metrics calculated during the validation step (by making the
+postprocessing causal) and will have no effect on training outcome. The resulting model will be equivalent in size to
+the samller variant in the original offline Beat This! implementation (with 128 as `transformer-dim` instead of 512). 
+
 ## Live version
 
 The plan is to turn the model into a causal one, which involves the convolutional layers, the time-directed partial

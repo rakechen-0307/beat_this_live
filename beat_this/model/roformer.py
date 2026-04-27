@@ -159,18 +159,18 @@ class Attend(nn.Module):
         if bm is not None:
             return bm
 
-        def local_mask(b, h, i, j):
-            return (j >= i - self.sw_attention_window_size) & (j <= i)
+        def local_mask(b, h, q_idx, kv_idx):
+            return (kv_idx >= q_idx - self.sw_attention_window_size) & (kv_idx <= q_idx)
 
         bm = create_block_mask(
             mask_mod=local_mask,
             B=None, H=None, # for efficiency --> see FlexAttention blogpost
             Q_LEN=q_len, KV_LEN=kv_len,
             device=device,
-            #_compile = True
         )
         self._block_mask_cache[key] = bm
         return bm
+
 
     def forward(self, q, k, v, use_kv_cache=False):
 
@@ -244,6 +244,7 @@ class Attention(Module):
     def _force_lastdim_inner(x):
         # robustly ensure last dim is contiguous
         return x if x.stride(-1) == 1 else x.transpose(-1, -2).contiguous().transpose(-1, -2)
+
 
     def forward(self, x, past_kv=None, use_kv_cache=False, peek_size=None, frame_idx=0):
         x = self.norm(x)

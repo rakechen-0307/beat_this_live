@@ -42,6 +42,7 @@ class Postprocessor:
         downbeat: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
         shift: int = 0,
+        sclm_lookahead_size: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Apply postprocessing to the input beat and downbeat tensors. Works with batched and unbatched inputs.
@@ -67,9 +68,7 @@ class Postprocessor:
             padding_mask = padding_mask.unsqueeze(0)
 
         if self.type == "minimal":
-            postp_beat, postp_downbeat = self.postp_minimal(
-                beat, downbeat, padding_mask
-            )
+            postp_beat, postp_downbeat = self.postp_minimal(beat, downbeat, padding_mask)
         elif self.type == "dbn":
             postp_beat, postp_downbeat = self.postp_dbn(beat, downbeat, padding_mask)
         elif self.type == "no_postprocessing":
@@ -77,7 +76,7 @@ class Postprocessor:
         elif self.type == "causal_thresholding":
             postp_beat, postp_downbeat = self.causal_thresholding(beat, downbeat)
         elif self.type == "shifted_causal_local_max":
-            postp_beat, postp_downbeat = self.shifted_causal_local_max(beat, downbeat, shift=shift)
+            postp_beat, postp_downbeat = self.shifted_causal_local_max(beat, downbeat, shift=shift, sclm_lookahead_size=sclm_lookahead_size)
         else:
             raise ValueError("Invalid postprocessing type")
 
@@ -243,9 +242,16 @@ class Postprocessor:
         return tuple(postp_beat), tuple(postp_downbeat)
 
 
-    def shifted_causal_local_max(self, beat, downbeat, threshold=1, shift=3, cooldown=5, db_anywhere=True):
+    def shifted_causal_local_max(self, beat, downbeat, threshold=1, shift=3, cooldown=5, db_anywhere=True, sclm_lookahead_size=None):
         """ Causal local max detection with a shift/lookahead of `shift` frames. Makes use of the fact that shifted
         models look `shift` frames into the future in order to identify local maxima more reliably."""
+
+        # by default, SCLM peeks `shift` frames into the future, but we can overwrite this to predict with 0 or
+        # negative latency
+        if sclm_lookahead_size:
+            s = sclm_lookahead_size
+        else:
+            s = shift
 
         # Ensure batched shape
         if beat.ndim == 1:
@@ -257,11 +263,9 @@ class Postprocessor:
         db_cooldown = 2 * int(cooldown)
 
         postp_beat, postp_down = [], []
-        win_len = 2 * shift + 1
-        center_idx = shift
-
-        ### TEST
-        db_threshold = threshold * 1 #.5
+        win_len = 2 * s + 1
+        center_idx = s
+        db_threshold = threshold * 1  # different threshold values were tested
 
         for i in range(B):
             beat_times, down_times = [], []
@@ -277,7 +281,7 @@ class Postprocessor:
                 winB.append(float(beat[i, t]))
                 winD.append(float(downbeat[i, t]))
 
-                # keep only the last 2*shift+1 entries
+                # keep only the last `win_len` entries
                 if len(winB) > win_len:
                     winB.pop(0)
                     winD.pop(0)
@@ -294,7 +298,10 @@ class Postprocessor:
 
                 if cB >= threshold and cB >= neigh_max_B and (t - last_beat) >= cooldown:
                     # only emit beat if: above threshold, is a local max in the center of the window, and cooldown passed
-                    time_s = t / fps
+                    if not sclm_lookahead_size:
+                        time_s = t / fps
+                    else:
+                        time_s = (t + (shift - sclm_lookahead_size)) / fps
                     beat_times.append(time_s)
                     last_beat = t
 

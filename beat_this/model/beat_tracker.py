@@ -177,31 +177,6 @@ class BeatThis(nn.Module):
             bias=False,
         )
 
-        '''block = nn.Sequential(
-            OrderedDict(
-                partial=(
-                    PartialFTTransformer(
-                        dim=in_dim,
-                        dim_head=head_dim,
-                        n_head=in_dim // head_dim,
-                        rotary_embed=rotary_embed,
-                        dropout=dropout,
-                        causal_transformer=causal_transformer,
-                        sw_attention_window_size=sw_attention_window_size,
-                        cached_kv=use_kv_cache,
-                    )
-                    if partial_transformers
-                    else nn.Identity()
-                ),
-                # conv block
-                conv2d=conv_layer,
-                # out_channels : 64, 128, 256
-                # freqs : 16, 8, 4 (due to the stride=2)
-                norm=nn.BatchNorm2d(out_dim),
-                activation=nn.GELU(),
-            )
-        )'''
-
         class FrontendBlock(nn.Module):
             """ Utility class to replace the original nn.Sequential with a custom forward method which is able to handle
             past_kv and use_kv_cache arguments for the partial transformer. """

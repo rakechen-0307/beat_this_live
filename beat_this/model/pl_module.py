@@ -8,6 +8,7 @@ from typing import Any
 
 import mir_eval
 import numpy as np
+import time
 import torch
 from pytorch_lightning import LightningModule
 
@@ -30,7 +31,7 @@ class PLBeatThis(LightningModule):
         dropout={"frontend": 0.1, "transformer": 0.2},
         lr=0.0008,
         weight_decay=0.01,
-         pos_weights={"beat": 1, "downbeat": 1},
+        pos_weights={"beat": 1, "downbeat": 1},
         head_dim=32,
         loss_type="shift_tolerant_weighted_bce",
         warmup_steps=1000,
@@ -41,15 +42,11 @@ class PLBeatThis(LightningModule):
         partial_transformers=True,
         causal_transformer=False,
         causal_convolution=False,
-        sw_attention_window_size=256,
+        sw_attention_window_size=0,
         segment_metrics=False,
         causal_inference=False,
         label_shift=0,
-        full_piece_metrics=False, # to be removed
-        streaming_inference=False, # to be removed
-        use_kv_cache=False, # to be removed
-        use_conv_cache=False, # to be removed
-        peek_size=False, # to be removed
+        sclm_lookahead_size=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -107,13 +104,17 @@ class PLBeatThis(LightningModule):
         if use_dbn:
             postp_type = "dbn"
         elif causal_inference:
-            if self.hparams.label_shift < 0: # label shifts are always negative values
+            if self.hparams.label_shift < 0:  # label shifts are always negative values
                 postp_type = "shifted_causal_local_max"
             else:
                 postp_type = "causal_thresholding"
         else:
             postp_type = "minimal"
         self.postprocessor = Postprocessor(type=postp_type, fps=fps)
+        print(f"Postprocessor type: {postp_type}")
+        if sclm_lookahead_size:
+            print(f"SCLM lookahead size: {sclm_lookahead_size}")
+
         self.eval_trim_beats = eval_trim_beats
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
@@ -176,7 +177,7 @@ class PLBeatThis(LightningModule):
                 # filter predictions and truth for the current segment
                 preds_segment = pospt_pred[(pospt_pred >= start) & (pospt_pred < end)]
                 truth_segment = piece_truth_time[(piece_truth_time >= start) & (piece_truth_time < end)]
-                seg_metrics = self.metrics(truth_segment, preds_segment, step=step)
+                seg_metrics = self.metrics(truth_segment, preds_segment, step=step, segmented=True)
                 piece_metrics[f"segment_{seg}"] = seg_metrics
             return piece_metrics
 
@@ -228,14 +229,6 @@ class PLBeatThis(LightningModule):
             return batch_metric
 
 
-    @staticmethod
-    def shift_predictions(pred_times, label_shift, fps):
-        """ Shift prediction times by -label_shift frames to correctly calculate metrics. """
-        if isinstance(pred_times, tuple):
-            return tuple(PLBeatThis.shift_predictions(x, label_shift, fps) for x in pred_times)
-        return pred_times - (label_shift / fps)
-
-
     def log_losses(self, losses, batch_size, step="train"):
         # log for separate targets
         for target in "beat", "downbeat":
@@ -271,6 +264,7 @@ class PLBeatThis(LightningModule):
                 sync_dist=True,
             )
 
+
     def training_step(self, batch, batch_idx):
         # run the model
         model_prediction = self.model(batch["spect"])
@@ -278,6 +272,7 @@ class PLBeatThis(LightningModule):
         losses = self._compute_loss(batch, model_prediction)
         self.log_losses(losses, len(batch["spect"]), "train")
         return losses["total"]
+
 
     def validation_step(self, batch, batch_idx):
         # run the model
@@ -290,10 +285,6 @@ class PLBeatThis(LightningModule):
             model_prediction["downbeat"],
             batch["padding_mask"],
         )
-        # shift predictions back if needed
-        if self.hparams.label_shift != 0:
-            postp_beat = self.shift_predictions(postp_beat, self.hparams.label_shift, self.hparams.fps)
-            postp_downbeat = self.shift_predictions(postp_downbeat, self.hparams.label_shift, self.hparams.fps)
         # compute the metrics
         metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="val")
         # log
@@ -307,6 +298,10 @@ class PLBeatThis(LightningModule):
         # log
         self.log_losses(losses, len(batch["spect"]), "test")
         self.log_metrics(metrics, batch["spect"].shape[0], "test")
+
+
+    def on_predict_start(self):
+        print(f"Device: {next(self.model.parameters()).device}")
 
 
     def predict_step(
@@ -339,12 +334,13 @@ class PLBeatThis(LightningModule):
         if self.hparams.causal_inference:
             # compute predictions for the full piece without splitting into chunks and apply causal postprocessing
             model_prediction = self.model(batch["spect"])
-            # causal postprocessing
-            postp_beat, postp_downbeat = self.postprocessor(model_prediction["beat"], model_prediction["downbeat"], shift=-self.hparams.label_shift) # negative label shift values are turned to positive as that's what the postprocessor expects
-            # shift predictions back if needed
-            #if self.hparams.label_shift != 0:
-            #    postp_beat = self.shift_predictions(postp_beat, self.hparams.label_shift, self.hparams.fps)
-            #    postp_downbeat = self.shift_predictions(postp_downbeat, self.hparams.label_shift, self.hparams.fps)
+            postp_beat, postp_downbeat = self.postprocessor(
+                model_prediction["beat"],
+                model_prediction["downbeat"],
+                shift= -self.hparams.label_shift, # negative label shift values are turned to positive as that's what the postprocessor expects
+                sclm_lookahead_size=self.hparams.sclm_lookahead_size
+            )
+
         else:
             # compute border size according to the loss type
             if hasattr(
@@ -411,13 +407,6 @@ class PLBeatThis(LightningModule):
 
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
-        #print("\n\nKeys in state_dict (before modifications):\n", list(state_dict.keys()))
-        # remove _orig_mod prefixes for compiled models
-        '''
-        This removal of _orig_mod prefixes from the state_dict breaks compatibility with compiled models which expect
-        _orig_mod prefixes. By NOT removing them (hence commenting it out), we can use the checkpoints with compiled
-        models. However, this means that for uncompiled applications, the prefix has to be removed manually.
-        '''
         state_dict = replace_state_dict_key(state_dict, "_orig_mod.", "")
         return state_dict
 
@@ -426,10 +415,13 @@ class Metrics:
     def __init__(self, eval_trim_beats: int) -> None:
         self.min_beat_time = eval_trim_beats
 
-    def __call__(self, truth, preds, step) -> Any:
+    def __call__(self, truth, preds, step, segmented=False) -> Any:
 
-        truth = mir_eval.beat.trim_beats(truth, min_beat_time=self.min_beat_time)
-        preds = mir_eval.beat.trim_beats(preds, min_beat_time=self.min_beat_time)
+        if not segmented:
+            # we don't trim for segmented evaluations, as a single segment is 10s long, i.e. a 5 second trim would
+            # destroy half of the first segment.
+            truth = mir_eval.beat.trim_beats(truth, min_beat_time=self.min_beat_time)
+            preds = mir_eval.beat.trim_beats(preds, min_beat_time=self.min_beat_time)
 
         if step == "val": # limit the metrics that are computed during validation to speed up training
             fmeasure = mir_eval.beat.f_measure(truth, preds)
