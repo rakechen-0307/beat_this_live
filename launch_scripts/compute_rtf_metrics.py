@@ -11,6 +11,9 @@ from beat_this.model.postprocessor import Postprocessor
 
 
 def compute_rtf_metrics(checkpoint_path, wav_folder):
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
     device = "cpu"
     print(f"Using {torch.get_num_threads()} CPU threads.")
 
@@ -28,9 +31,13 @@ def compute_rtf_metrics(checkpoint_path, wav_folder):
     failed = 0
     failed_files = []
 
+    max_examples = 100
+
     wav_files = sorted(Path(wav_folder).rglob("*.wav"))
 
     for wav in tqdm(wav_files, desc="Processing audio"):
+        if processed >= max_examples:
+            break
         try:
             waveform, sr = load_audio(wav)
 
@@ -89,5 +96,5 @@ def convert_mp3_to_wav():
 
 if __name__ == '__main__':
     wav_folder = "data/audio/wav/gtzan/"
-    checkpoint_path = "checkpoints/S0 shift_tolerant_weighted_bce-h512-augTrueTrueTruect=1 cc=1 sw256 shifted-3.ckpt"
+    checkpoint_path = "checkpoints/S0 shift_tolerant_weighted_bce-h128-augTrueTrueTruect=1 cc=1 sw256 shifted-1.ckpt"
     compute_rtf_metrics(checkpoint_path, wav_folder)

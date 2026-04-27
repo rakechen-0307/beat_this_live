@@ -10,6 +10,8 @@ from torch import nn
 from torch.nn import Module, ModuleList
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
 
+flex_attention_compiled = torch.compile(flex_attention)
+
 # helper functions
 
 
@@ -144,32 +146,35 @@ class Attend(nn.Module):
         self.scale = scale
         self.causal_transformer = causal_transformer
         self.sw_attention_window_size = int(sw_attention_window_size)
-        self._block_mask_cache = {} # caching the block mask for sw_attention for efficiency
+        #self._block_mask_cache = {} # caching the block mask for sw_attention for efficiency
+        self.BLOCK = 128
 
-    @staticmethod
-    def _force_lastdim_inner(x):
-        # robustly ensure last dim is contiguous
-        return x if x.stride(-1) == 1 else x.transpose(-1, -2).contiguous().transpose(-1, -2)
-
-    @torch._dynamo.disable()  # build mask in eager to avoid ShapeAsConstantBuffer issues
     def _get_block_mask(self, q_len, kv_len, device):
-        dev_key = -1 if device.type != "cuda" else (device.index or 0)
-        key = (q_len, kv_len, dev_key, self.sw_attention_window_size)
-        bm = self._block_mask_cache.get(key)
-        if bm is not None:
-            return bm
+        #key = (q_len, kv_len, device, self.sw_attention_window_size)
+        #if key in self._block_mask_cache:
+        #    return self._block_mask_cache[key]
+
+        BLOCK = self.BLOCK
+        W = self.sw_attention_window_size
+        assert W % BLOCK == 0, "Window size must be multiple of BLOCK"
+
+        window_blocks = W
 
         def local_mask(b, h, q_idx, kv_idx):
-            return (kv_idx >= q_idx - self.sw_attention_window_size) & (kv_idx <= q_idx)
+            q_block = q_idx
+            kv_block = kv_idx
+            return (kv_block <= q_block) & (kv_block >= q_block - window_blocks)
 
-        bm = create_block_mask(
+        block_mask = create_block_mask(
             mask_mod=local_mask,
             B=None, H=None, # for efficiency --> see FlexAttention blogpost
-            Q_LEN=q_len, KV_LEN=kv_len,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
             device=device,
         )
-        self._block_mask_cache[key] = bm
-        return bm
+
+        #self._block_mask_cache[key] = block_mask
+        return block_mask
 
 
     def forward(self, q, k, v, use_kv_cache=False):
@@ -180,14 +185,10 @@ class Attend(nn.Module):
             kv_len = k.shape[2]
 
             block_mask = self._get_block_mask(q_len, kv_len, q.device)
-            q = self._force_lastdim_inner(q)
-            k = self._force_lastdim_inner(k)
-            v = self._force_lastdim_inner(v)
 
-            return flex_attention(
+            return flex_attention_compiled(
                 q, k, v,
-                block_mask=block_mask,
-                scale=None
+                block_mask=block_mask
             )
 
         else:

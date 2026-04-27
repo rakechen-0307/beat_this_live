@@ -100,6 +100,15 @@ def datamodule_setup(checkpoint, num_workers, datasplit):
     datamodule = BeatDataModule(**datamodule_hparams)
     datamodule.setup(stage="predict")
 
+    max_len = 40000
+
+    ds = datamodule.predict_dataset
+
+    ds.items = [
+        item for item in ds.items
+        if ds._get_spect(item).shape[0] <= max_len
+    ]
+
     return datamodule
 
 
