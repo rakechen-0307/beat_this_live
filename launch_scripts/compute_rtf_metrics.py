@@ -53,7 +53,7 @@ def compute_rtf_metrics(checkpoint_path, wav_folder):
             with torch.inference_mode():
                 spect = spect_transform(x)
                 pred = model(spect.unsqueeze(0))
-                postp_beat, postp_downbeat = postprocessor(pred["beat"], pred["downbeat"])
+                postp_beat, postp_downbeat = postprocessor(pred["beat"], pred["downbeat"], sclm_lookahead_size=1)
             elapsed = time.perf_counter() - t0
 
             total_audio_time += audio_duration
@@ -96,5 +96,5 @@ def convert_mp3_to_wav():
 
 if __name__ == '__main__':
     wav_folder = "data/audio/wav/gtzan/"
-    checkpoint_path = "checkpoints/S0 shift_tolerant_weighted_bce-h128-augTrueTrueTruect=1 cc=1 sw256 shifted-1.ckpt"
+    checkpoint_path = "checkpoints/S0 shift_tolerant_weighted_bce-h128-augTrueTrueTruect=1 cc=1 sw256 shifted-3.ckpt"
     compute_rtf_metrics(checkpoint_path, wav_folder)
