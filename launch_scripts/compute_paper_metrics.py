@@ -2,6 +2,8 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import re
+import json
 from pytorch_lightning import Trainer, seed_everything
 
 from beat_this.dataset import BeatDataModule
@@ -33,14 +35,17 @@ def main(args):
         sclm_lookahead_size=args.sclm_lookahead_size,
     )
     # predict
-    metrics, dataset, preds, piece = compute_predictions(model, trainer, datamodule.predict_dataloader())
+    metrics, dataset, preds, pieces = compute_predictions(model, trainer, datamodule.predict_dataloader())
 
     # compute averaged metrics
     averaged_metrics = {k: np.mean(v) for k, v in metrics.items()}
 
     # compute metrics averaged by dataset
     dataset_metrics = {
-        k: {d: np.mean(v[dataset == d]) for d in np.unique(dataset)}
+        k: {
+            d: np.mean(v[dataset == d])
+            for d in np.unique(dataset)
+        }
         for k, v in metrics.items()
     }
 
@@ -54,6 +59,26 @@ def main(args):
         for d, value in v.items():
             print(f"{d}: {value}")
         print("------")
+
+    # compute genre metrics
+    if args.datasplit == 'test':
+        genres = np.array([extract_genre(piece) for piece in pieces])
+
+        genre_metrics = {
+            metric_name: {
+                str(genre): np.asarray(metric_values)[genres == genre]
+                .astype(float)
+                .tolist()
+                for genre in np.unique(genres)
+            }
+            for metric_name, metric_values in metrics.items()
+        }
+
+        save_genre_metrics(
+            genre_metrics=genre_metrics,
+            model_path=args.model,
+            output_dir="plots/genre_metrics",
+        )
 
     if args.update_wandb:
         print(f'Attempting to update wandb metrics for run: {args.update_wandb}')
@@ -204,6 +229,24 @@ def compute_predictions(model, trainer, predict_dataloader):
     return metrics, dataset, preds, piece
 
 
+def save_genre_metrics(genre_metrics, model_path, output_dir="genre_metrics"):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_name = Path(model_path).stem
+    output_path = output_dir / f"{model_name}_genre_metrics.json"
+
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(genre_metrics, f, indent=4, sort_keys=True)
+
+    print(f"Saved genre metrics to: {output_path}")
+
+
+def extract_genre(piece):
+    match = re.search(r"gtzan_(.*?)_\d+", str(piece))
+    return match.group(1)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Computes predictions for a given model and dataset, "
@@ -271,7 +314,7 @@ if __name__ == "__main__":
         default=None,
         type=int,
         help="Lookahead size for SCLM postprocessing (default: shift size of trained model)."
-             "By choosing a lookahead size < shift size, we can predict with 0 or negative latency.)",
+             "By choosing a lookahead size < shift size, we can predict with 0 or negative latency.",
     )
 
     args = parser.parse_args()
