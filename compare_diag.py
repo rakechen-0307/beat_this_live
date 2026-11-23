@@ -1049,7 +1049,7 @@ def classify(row, ok_f, eval_active_only=False):
         return "n/a"
     if f70 >= ok_f:
         return "ok"
-    if (not eval_active_only) and row["active_frac"] < 0.5:
+    if (not eval_active_only) and row["active_frac"] < 0.2:
         return "mostly_silent"
     if not (row["tempo_valid_frac"] >= 0.5) or row["pk_n_est"] < 2:
         return "never_acquired"
