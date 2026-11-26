@@ -1,0 +1,94 @@
+gpu: 2
+seed: 42
+output_dir: /data/hdd0/rakec/outputs/Beat_This_Live
+
+wandb:
+  enabled: true
+  project: LiveBand_BTL
+  entity: null
+  name: btl_zero_guitar_ft
+  mode: online
+  log_every_steps: 20
+
+model:
+  pretrained_ckpt: ./checkpoints/beat_this_live_zero.ckpt
+  freeze_stem: false
+  freeze_stem_bn: false         # keep false unless batch_size <= 2
+
+data:
+  fps: 50.0
+  sr_22k: 22050
+  n_fft: 1024
+  hop_22k: 441
+  soxr_quality: LQ
+  train_length: 1536
+  samples_per_epoch: 6400
+  val_max_renders_per_track: 2
+  num_workers: 4
+  datasets:
+    slakh2100:
+      root: /data/ssd0/rakec/slakh2100/processed
+      weight: 0.60
+    guitarset:
+      root: /data/ssd0/rakec/guitarset/processed
+      weight: 0.20
+    egdb:
+      root: /data/ssd0/rakec/egdb/processed
+      weight: 0.20
+
+silence_mask:
+  enabled: true
+  silence_db: -40.0
+  hold_sec: 1.5
+  edge_ignore_frames: 25
+  min_active_frac: 0.20
+
+augment:
+  enabled: true
+  speed_prob: 0.70
+  speed_min: 0.88
+  speed_max: 1.12
+  gain_db_min: -12.0
+  gain_db_max: 6.0
+  tilt_prob: 0.50
+  tilt_alpha_min: -0.6
+  tilt_alpha_max: 0.6
+  overdrive_prob: 0.35
+  overdrive_min: 1.5
+  overdrive_max: 6.0
+  noise_prob: 0.50
+  noise_snr_min: 25.0
+  noise_snr_max: 45.0
+  spec_freq_mask_prob: 0.30
+  spec_freq_mask_width: 16
+
+train:
+  epochs: 50
+  batch_size: 8
+  grad_accum: 2
+  lr: 5.0e-5
+  min_lr: 1.0e-6
+  weight_decay: 0.01
+  warmup_steps: 400
+  scheduler: wsd
+  decay_start_ratio: 0.8
+  tail_start_ratio: 0.9
+  tail_ratio: null
+  grad_clip: 10.0
+  use_amp: false
+  ema_decay: 0.995
+  eval_every: 1
+  save_every: 5
+  loss:
+    tolerance: 2
+    downbeat_weight: 1.0
+    pos_weight_mode: from_ckpt
+    beat_pos_weight: 19.0
+    downbeat_pos_weight: 85.0
+
+eval:
+  tol_sec: 0.07
+  peak_threshold: 0.5
+  peak_pool_size: 7
+  active_eval_silence_db: -40.0
+  active_eval_hold_sec: 1.5

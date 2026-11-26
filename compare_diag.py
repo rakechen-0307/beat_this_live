@@ -1,34 +1,12 @@
 """
 compare_diag.py  -- diagnostic evaluation of the real-time PLP beat tracker on guitar stems.
 
-Built on compare_full.py. Everything from the old script (F-measure, Cemgil, CML/AML, PLV, tempo accuracy,
-chance baseline, worst/best/random renders) is kept, and the following diagnostics are added so that a bad
-F1@70ms can be attributed to a cause instead of guessed:
-
-  A. LATENCY vs JITTER      F at 50/70/100/150/200 ms, signed-offset median (bias) and MAD (jitter),
-                            per-track de-biased F70, and a global shift sweep F70(delta).
-  B. FRONT-END vs BACK-END  The tracker is re-run with an ORACLE activation (Gaussian bumps at the GT beats,
-                            muted when the stem is silent, optional onset jitter) and optionally with
-                            Beat This! Live (50 FPS -> 30 FPS via btl_frontend.py) or causal Flux x BTL
-                            fusion injected in place of spectral flux.
-                              oracle offset            = back-end / time-convention bias
-                              real offset - oracle off = front-end latency
-                              oracle F70 low           = even perfect onsets fail -> back-end problem
-  C. ONSET STATISTICS       Peaks of the primary activation vs GT beats: recall@50/100 ms, precision@100 ms,
-                            onsets per beat, activation salience at beats, signed onset offset (front-end only).
-  D. METRICAL VARIANTS      F70 against beat / off-beat / double / half-time versions of the GT.
-  E. REGIONS                GT-beat hit rate (<=70 ms) in silence / first 4 s after an entry / steady state,
-                            and time-to-acquire (first 4 consecutive hits).
-  F. TAXONOMY               Every window/track gets one `cause` (ok, mostly_silent, never_acquired, offbeat_phase,
-                            double_time, half_time, tempo_wrong, constant_latency, timing_jitter, phase_lost)
-                            and a `blame` (front-end / back-end / input).
-
-Outputs (in --out_dir): tracks.csv, windows.csv, shift_sweep.csv, summary.txt, summary.png, diagnosis.png,
-plots/ (renders: best, worst and a random sample for every cause).
-
-Conventions: all offsets are signed, > 0 = tracker LATE. `pk_*` = events from the phase wrap of (sin, cos),
-`flag_*` = events from detect_beat, `btl_*` = Beat This! Live comparison run, `orc<J>_*` = oracle run with
-J ms of onset jitter.
+Aligned with live inference defaults in streaming.py:
+  - Beat This! Live + non-destructive causal Flux boost (btl_fusion_mode='boost', btl_flux_boost=0.6)
+  - Causal STFT enabled by default (--btl_centered_stft to disable)
+  - Calibrated timing alignment (btl_extra_shift_ms=-6.0, phase_lead_ms=0.0, harmonic_weight=0.0, energy_threshold=0.015)
+  - Updated PLP lock-in settings (lock_conf_threshold=1.8, acquire_min_active_sec=2.0, lock_sec=2.0, lock_tol_bpm=3.0)
+  - Supports Slakh2100, GuitarSet, and EGDB (prefers beats.tsv, falls back to all_src.mid).
 """
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -79,17 +57,17 @@ PLV_OK = 0.5
 N_PLOT_WORST = 30
 N_PLOT_BEST = 20
 N_PLOT_PER_CAUSE = 8
-CACHE_VERSION = "diag_v1"
+CACHE_VERSION = "diag_v3"
 
 # --- diagnostics ---
-TOLS = (0.05, 0.07, 0.10, 0.15, 0.20)          # F-measure tolerances (s)
-SHIFTS_MS = np.arange(-150, 151, 10)           # global shift sweep applied to predicted beats
-OFFSET_CAP_S = 0.25                            # |signed offset| cap for bias/jitter statistics
-RESUME_SEC = 4.0                               # "entry/resume" region length after silence -> active
+TOLS = (0.05, 0.07, 0.10, 0.15, 0.20)
+SHIFTS_MS = np.arange(-150, 151, 10)
+OFFSET_CAP_S = 0.25
+RESUME_SEC = 4.0
 REGIONS = ("silent", "resume", "steady")
-ONSET_REL_THR = 0.15                           # onset peak height >= thr * p99(activation)
-ORACLE_SIGMA_S = 0.02                          # width of the oracle activation bumps
-JUMP_BPM = 6.0                                 # tempo change between frames counted as a "jump"
+ONSET_REL_THR = 0.15
+ORACLE_SIGMA_S = 0.02
+JUMP_BPM = 6.0
 CAUSES = ["ok", "mostly_silent", "never_acquired", "offbeat_phase", "double_time", "half_time",
           "tempo_wrong", "constant_latency", "timing_jitter", "phase_lost"]
 REQ_KEYS = ("sin", "cos", "tempo", "act", "flag", "active", "lock", "fps", "num_frames")
@@ -102,36 +80,49 @@ DEFAULT_BEAT_CFG = {
     "high_bpm": 179,
     "lookahead": 7,
     "n_time": 10,
-    "silence_db": -40.0,
-    "hold_frames": 30,
+    "silence_db": -40.0,            # matches live streaming.py (use --silence_db -45.0 for clean DI/Slakh)
+    "hold_frames": 36,
     "conf_threshold": 1.6,
+    "lock_conf_threshold": 1.8,     # updated inference lock confidence threshold
     "switch_ratio": 1.3,
-    "energy_threshold": 0.05,
+    "energy_threshold": 0.015,
     "lock_enable": True,
-    "lock_sec": 3.0,
-    "lock_tol_bpm": 4.0,
+    "lock_sec": 2.0,                # updated inference lock duration
+    "lock_tol_bpm": 3.0,            # updated inference lock tolerance
     "lose_rho": 0.5,
     "lose_conf": 1.15,
     "lose_err": 0.4,
     "phase_gate": 0.25,
-    "reacquire_sec": 3.5,
+    "reacquire_sec": 3.0,
     "pll_tau_sec": 1.5,
     "pll_conf_hi": 3.0,
-    "switch_persist_sec": 2.0,
-    "harmonic_weight": 0.5,
-    "relock_sec": 3.0,
+    "switch_persist_sec": 1.5,
+    "harmonic_weight": 0.0,
+    "acquire_min_active_sec": 2.0,  # updated inference tempogram warm-up before lock counting
+    "relock_sec": 2.5,
     "relock_coh": 0.55,
     "relock_min_w": 0.15,
-    "resume_gate_sec": 2.0,
-    "silence_reopen_sec": 2.0,
+    "resume_gate_sec": 3.0,
+    "silence_reopen_sec": 1.5,
+    "resume_gain": 3.0,
+    "phase_lead_ms": 0.0,           # BTL runs default to 0.0 ms (matching streaming.py); oracle stays 0.0
     "hop": 1600,
 }
-TRACKER_KEYS = ["hop", "n_time", "low_bpm", "high_bpm", "lookahead", "silence_db",
-                "hold_frames", "conf_threshold", "switch_ratio", "energy_threshold",
-                "lock_enable", "lock_sec", "lock_tol_bpm", "lose_rho", "lose_conf", "lose_err", "phase_gate",
-                "reacquire_sec", "pll_tau_sec", "pll_conf_hi", "switch_persist_sec", "harmonic_weight",
-                "relock_sec", "relock_coh", "relock_min_w", "resume_gate_sec", "silence_reopen_sec"]
-LOCK_KEYS = TRACKER_KEYS[TRACKER_KEYS.index("lock_enable"):]
+
+# Parameters passed into RealTimeBeatTracker.from_args via **kwargs
+LOCK_KEYS = [
+    "lock_enable", "lock_sec", "lock_tol_bpm", "lose_rho", "lose_conf", "lose_err", "phase_gate",
+    "reacquire_sec", "pll_tau_sec", "pll_conf_hi", "switch_persist_sec", "harmonic_weight",
+    "acquire_min_active_sec", "relock_sec", "relock_coh", "relock_min_w",
+    "resume_gate_sec", "silence_reopen_sec", "resume_gain",
+]
+
+# Full set of tracker settings hashed into cache filenames
+TRACKER_KEYS = [
+    "hop", "n_time", "low_bpm", "high_bpm", "lookahead", "silence_db",
+    "hold_frames", "conf_threshold", "lock_conf_threshold", "switch_ratio",
+    "energy_threshold", "phase_lead_ms",
+] + LOCK_KEYS
 
 
 def fkey(t):
@@ -143,12 +134,21 @@ def oracle_names(cfg):
 
 
 def compare_names(cfg):
-    """Extra runs compared alongside the primary run (`pk`)."""
     names = []
     if cfg.get("btl_ckpt") and not cfg.get("btl_primary"):
         names.append("btl")
     names.extend(oracle_names(cfg))
     return names
+
+
+def btl_mode_label(cfg, short=False):
+    mode = cfg.get("btl_fusion_mode", "none")
+    ckpt_stem = pathlib.Path(cfg["btl_ckpt"]).stem if cfg.get("btl_ckpt") else "btl"
+    if mode == "boost":
+        return f"BTL+FluxBoost [{ckpt_stem}]" if short else f"Beat This! Live + Flux boost ({ckpt_stem})"
+    if mode == "mul":
+        return f"Flux x BTL [{ckpt_stem}]" if short else f"Flux x Beat This! Live ({ckpt_stem})"
+    return f"Beat This! Live [{ckpt_stem}]" if short else f"Beat This! Live ({ckpt_stem})"
 
 
 def parse_args():
@@ -164,16 +164,20 @@ def parse_args():
     p.add_argument("--lookahead", type=int, default=None, help="override PLP tracker lookahead (30FPS frames)")
     p.add_argument("--no_lock", action="store_true", help="disable lock mode (A/B comparison)")
     p.add_argument("--low_bpm", type=int, default=None, help="lower edge of the one-octave tempo range (default 90)")
-    p.add_argument("--pk_offset_frames", type=float, default=None,
-                   help="time convention of phase-wrap events/frame_times, in 30FPS frames after the activation "
-                        "timestamp (default lookahead + 1.0, as in compare_full.py)")
-    p.add_argument("--flag_offset_frames", type=float, default=None,
-                   help="time convention of detect_beat events (default lookahead + 1.0, as in compare_full.py)")
+    p.add_argument("--silence_db", type=float, default=None, help="silence gate threshold in dB (default -40.0)")
+    p.add_argument("--lock_conf_threshold", type=float, default=None, help="peak/mean ratio required to lock (default 1.8)")
+    p.add_argument("--acquire_min_active_sec", type=float, default=None, help="active warm-up seconds before lock counting (default 2.0)")
+    p.add_argument("--lock_sec", type=float, default=None, help="steady tempo seconds required to lock (default 2.0)")
+    p.add_argument("--lock_tol_bpm", type=float, default=None, help="tempo consistency band for locking in BPM (default 3.0)")
+    p.add_argument("--phase_lead_ms", type=float, default=None,
+                   help="downstream phase-lead compensation in ms (default 0.0 for BTL, 0.0 for flux)")
+    p.add_argument("--pk_offset_frames", type=float, default=None)
+    p.add_argument("--flag_offset_frames", type=float, default=None)
     p.add_argument("--no_oracle", action="store_true", help="skip the oracle-activation runs")
-    p.add_argument("--oracle_jitter_ms", type=float, nargs="+", default=[0.0, 30.0],
-                   help="onset jitter (ms) of each oracle run; the FIRST one is the reference oracle")
+    p.add_argument("--oracle_jitter_ms", type=float, nargs="+", default=[0.0, 30.0])
     p.add_argument("--ok_f", type=float, default=0.6, help="F70 above which a window counts as 'ok'")
 
+    # Beat This! Live frontend settings (defaults match streaming.py inference)
     p.add_argument("--btl_ckpt", type=str, default=None, help="path to Beat This! Live .ckpt")
     p.add_argument("--btl_device", type=str, default="cuda", help="device for Beat This! Live inference")
     p.add_argument("--btl_primary", action="store_true",
@@ -181,47 +185,40 @@ def parse_args():
     p.add_argument("--btl_streaming", action="store_true",
                    help="use strictly causal BeatThisLiveActivation (streaming) instead of BeatThisLiveOffline")
     p.add_argument("--btl_causal_stft", action="store_true",
-                   help="use causal (center=False) STFT in BeatThisLiveOffline for streaming parity")
-    p.add_argument("--btl_soxr_quality", type=str, default="LQ", choices=["QQ", "LQ", "HQ", "VHQ", "MQ"],
-                   help="soxr resampling quality (LQ keeps Live/Large strictly causal with +10 ms margin)")
-    p.add_argument("--btl_context_frames", type=int, default=None,
-                   help="rolling context ring length for --btl_streaming (default sw_window + 34)")
-    p.add_argument("--btl_no_shift_align", action="store_true",
-                   help="disable label_shift alignment in btl_frontend.py (to inspect raw model shift)")
-    p.add_argument("--btl_target_lead_ms", type=float, default=0.0,
-                   help="optional activation grid lead (ms) in btl_frontend.py; compensated in event timestamps")
-    p.add_argument("--btl_extra_shift_ms", type=float, default=0.0,
-                   help="empirical calibration shift (ms) applied to BTL 50 FPS timestamps")
-    p.add_argument("--btl_resample_method", type=str, default="max", choices=["linear", "max", "avg"],
-                   help="50 FPS -> 30 FPS resampling method in btl_frontend.py")
-    p.add_argument("--btl_downbeat_weight", type=float, default=0.0,
-                   help="weight to add downbeat probability onto beat probability")
-    p.add_argument("--btl_act_power", type=float, default=1.0,
-                   help="exponent applied to BTL activation (>1 sharpens broad peaks)")
-    p.add_argument("--btl_energy_threshold", type=float, default=None,
-                   help="optional PLP energy_threshold override for BTL runs (e.g. 0.01 for unfused [0,1] probs)")
-    p.add_argument("--btl_harmonic_weight", type=float, default=None,
-                   help="optional PLP harmonic_weight override for BTL runs (e.g. 0.0)")
+                   help="enable causal (center=False) STFT in offline mode (already on by default)")
+    p.add_argument("--btl_centered_stft", action="store_true",
+                   help="disable causal STFT in offline mode (legacy centered STFT)")
+    p.add_argument("--btl_use_amp", action="store_true", help="enable bf16/fp16 autocast for BTL inference")
+    p.add_argument("--btl_use_cuda_graph", action="store_true", help="enable CUDA graph in --btl_streaming mode")
+    p.add_argument("--btl_soxr_quality", type=str, default="LQ", choices=["QQ", "LQ", "HQ", "VHQ", "MQ"])
+    p.add_argument("--btl_context_frames", type=int, default=None)
+    p.add_argument("--btl_no_shift_align", action="store_true")
+    p.add_argument("--btl_target_lead_ms", type=float, default=0.0)
+    p.add_argument("--btl_extra_shift_ms", type=float, default=-6.0,
+                   help="empirical calibration shift in ms (default -6.0 matching streaming.py)")
+    p.add_argument("--btl_resample_method", type=str, default="max", choices=["linear", "max", "avg"])
+    p.add_argument("--btl_downbeat_weight", type=float, default=0.0)
+    p.add_argument("--btl_act_power", type=float, default=1.0)
+    p.add_argument("--btl_energy_threshold", type=float, default=None)
+    p.add_argument("--btl_harmonic_weight", type=float, default=None)
+    p.add_argument("--btl_recompute_act", action="store_true")
 
-    p.add_argument("--btl_recompute_act", action="store_true",
-                   help="force recomputation of cached BTL neural activations")
+    p.add_argument("--btl_fusion_mode", type=str, default="boost", choices=["none", "boost", "mul"],
+                   help="causal fusion with spectral flux (default 'boost' matching streaming.py)")
+    p.add_argument("--btl_flux_boost", type=float, default=0.6,
+                   help="boost weight for --btl_fusion_mode boost (default 0.6 matching streaming.py)")
+    p.add_argument("--btl_flux_ema_alpha", type=float, default=0.01)
+    p.add_argument("--btl_flux_norm_cap", type=float, default=2.0)
     p.add_argument("--btl_fuse_flux", action="store_true",
-                   help="causally fuse spectral flux with Beat This! Live activation (no GT, causal)")
-    p.add_argument("--btl_fuse_eps", type=float, default=0.05,
-                   help="floor added to causal Beat This! max-gate during flux fusion")
-    p.add_argument("--btl_fuse_past", type=int, default=2,
-                   help="past 30FPS frames included in causal Beat This! max-gate")
-    p.add_argument("--btl_fuse_fut", type=int, default=0,
-                   help="future 30FPS frames in max-gate (keep 0 for strict causality)")
+                   help="legacy alias for --btl_fusion_mode mul")
+    p.add_argument("--btl_fuse_eps", type=float, default=0.05)
+    p.add_argument("--btl_fuse_past", type=int, default=2)
+    p.add_argument("--btl_fuse_fut", type=int, default=0)
 
-    p.add_argument("--min_window_active_frac", type=float, default=0.1,
-                   help="skip 30s windows with active_frac below this threshold (e.g. 0.1)")
-    p.add_argument("--min_track_active_frac", type=float, default=0.1,
-                   help="skip full tracks with active_frac below this threshold (e.g. 0.1)")
-    p.add_argument("--eval_active_only", action="store_true",
-                   help="mask both GT beats and predicted beats to active (non-silent) regions")
-    p.add_argument("--plot_exclude_silent", action="store_true",
-                   help="exclude mostly_silent windows from worst and cause-* renders")
+    p.add_argument("--min_window_active_frac", type=float, default=0.1)
+    p.add_argument("--min_track_active_frac", type=float, default=0.1)
+    p.add_argument("--eval_active_only", action="store_true")
+    p.add_argument("--plot_exclude_silent", action="store_true")
     return p.parse_args()
 
 
@@ -240,7 +237,6 @@ def make_paths(args):
 def load_cfg(args):
     cfg = dict(DEFAULT_BEAT_CFG)
 
-    # Tracker always runs at 30 FPS (hop=1600 at 48 kHz); btl_frontend resamples 50 FPS -> 30 FPS.
     cfg["hop"] = 1600
     if args.low_bpm is not None:
         cfg["low_bpm"] = int(args.low_bpm)
@@ -251,6 +247,17 @@ def load_cfg(args):
     cfg["high_bpm"] = want_high
     if args.no_lock:
         cfg["lock_enable"] = False
+    if args.silence_db is not None:
+        cfg["silence_db"] = float(args.silence_db)
+    if args.lock_conf_threshold is not None:
+        cfg["lock_conf_threshold"] = float(args.lock_conf_threshold)
+    if args.acquire_min_active_sec is not None:
+        cfg["acquire_min_active_sec"] = float(args.acquire_min_active_sec)
+    if args.lock_sec is not None:
+        cfg["lock_sec"] = float(args.lock_sec)
+    if args.lock_tol_bpm is not None:
+        cfg["lock_tol_bpm"] = float(args.lock_tol_bpm)
+
     cfg["lookahead"] = int(args.lookahead) if args.lookahead is not None else int(cfg["lookahead"])
     cfg["pk_offset_frames"] = float(args.pk_offset_frames) if args.pk_offset_frames is not None \
         else cfg["lookahead"] + 1.0
@@ -259,11 +266,13 @@ def load_cfg(args):
     cfg["oracle_jitters"] = [] if args.no_oracle else [float(j) for j in args.oracle_jitter_ms]
     cfg["ok_f"] = float(args.ok_f)
 
-    # Beat This! Live settings (strictly separate from PLP.lookahead)
+    # Beat This! Live settings (matching streaming.py defaults)
     cfg["btl_ckpt"] = args.btl_ckpt
     cfg["btl_primary"] = bool(args.btl_primary and args.btl_ckpt)
     cfg["btl_streaming"] = bool(args.btl_streaming)
-    cfg["btl_causal_stft"] = bool(args.btl_causal_stft)
+    cfg["btl_causal_stft"] = not bool(args.btl_centered_stft)
+    cfg["btl_use_amp"] = bool(args.btl_use_amp)
+    cfg["btl_use_cuda_graph"] = bool(args.btl_use_cuda_graph)
     cfg["btl_soxr_quality"] = str(args.btl_soxr_quality)
     cfg["btl_context_frames"] = int(args.btl_context_frames) if args.btl_context_frames is not None else None
     cfg["btl_align_shift"] = not bool(args.btl_no_shift_align)
@@ -274,10 +283,25 @@ def load_cfg(args):
     cfg["btl_act_power"] = float(args.btl_act_power)
     cfg["btl_energy_threshold"] = args.btl_energy_threshold
     cfg["btl_harmonic_weight"] = args.btl_harmonic_weight
-    cfg["btl_fuse_flux"] = bool(args.btl_fuse_flux)
+
+    if args.btl_fusion_mode is not None:
+        fusion_mode = str(args.btl_fusion_mode)
+    elif args.btl_fuse_flux:
+        fusion_mode = "mul"
+    else:
+        fusion_mode = "boost"
+    cfg["btl_fusion_mode"] = fusion_mode
+    cfg["btl_fuse_flux"] = (fusion_mode != "none")
+    cfg["btl_flux_boost"] = float(args.btl_flux_boost)
+    cfg["btl_flux_ema_alpha"] = float(args.btl_flux_ema_alpha)
+    cfg["btl_flux_norm_cap"] = float(args.btl_flux_norm_cap)
     cfg["btl_fuse_eps"] = float(args.btl_fuse_eps)
     cfg["btl_fuse_past"] = int(args.btl_fuse_past)
     cfg["btl_fuse_fut"] = int(args.btl_fuse_fut)
+
+    # Phase lead defaults to 0.0 ms for BTL runs (matching streaming.py), 0.0 ms for pure spectral flux
+    cfg["phase_lead_ms_override"] = args.phase_lead_ms
+    cfg["phase_lead_ms"] = float(args.phase_lead_ms) if args.phase_lead_ms is not None else 0.0
 
     cfg["min_window_active_frac"] = float(args.min_window_active_frac)
     cfg["min_track_active_frac"] = float(args.min_track_active_frac)
@@ -288,26 +312,35 @@ def load_cfg(args):
 
 
 def btl_tracker_cfg(cfg):
-    """Return tracker config used for BTL runs (applying any BTL-only PLP overrides)."""
+    """Return tracker config used for BTL runs (matching streaming.py inference defaults)."""
     c = dict(cfg)
+    prob_scale = cfg.get("btl_ckpt") and cfg.get("btl_fusion_mode", "boost") in ("none", "boost")
     if cfg.get("btl_energy_threshold") is not None:
         c["energy_threshold"] = float(cfg["btl_energy_threshold"])
-    elif cfg.get("btl_ckpt") and not cfg.get("btl_fuse_flux"):
-        # Unfused BTL probabilities live in [0, 1] rather than spectral-flux scale
+    elif prob_scale:
         c["energy_threshold"] = min(float(c["energy_threshold"]), 0.015)
+
     if cfg.get("btl_harmonic_weight") is not None:
         c["harmonic_weight"] = float(cfg["btl_harmonic_weight"])
+    elif prob_scale:
+        c["harmonic_weight"] = 0.0
+
+    if cfg.get("phase_lead_ms_override") is not None:
+        c["phase_lead_ms"] = float(cfg["phase_lead_ms_override"])
+    elif cfg.get("btl_ckpt"):
+        c["phase_lead_ms"] = 0.0
     return c
 
 
 def btl_act_sig(cfg):
-    """Short deterministic hash identifying the BTL checkpoint + extraction settings."""
     ckpt_name = pathlib.Path(cfg["btl_ckpt"]).stem
     key = json.dumps({
         "ckpt": ckpt_name,
         "hop": cfg["hop"],
         "streaming": cfg["btl_streaming"],
+        "comp_resamp": True if cfg["btl_streaming"] else False,
         "causal_stft": cfg["btl_causal_stft"] if not cfg["btl_streaming"] else True,
+        "amp": cfg["btl_use_amp"],
         "soxr": cfg["btl_soxr_quality"],
         "ctx": cfg["btl_context_frames"],
         "align": cfg["btl_align_shift"],
@@ -321,11 +354,20 @@ def btl_act_sig(cfg):
 
 
 def btl_run_sig(cfg):
-    """Cache tag for tracker runs driven by BTL (includes causal flux fusion settings)."""
     base = btl_act_sig(cfg)
-    if not cfg.get("btl_fuse_flux"):
+    mode = cfg.get("btl_fusion_mode", "boost")
+    if mode == "none":
         return f"btl_{base}"
+    if mode == "boost":
+        fkey_str = json.dumps({
+            "mode": "boost",
+            "boost": cfg["btl_flux_boost"],
+            "alpha": cfg["btl_flux_ema_alpha"],
+            "cap": cfg["btl_flux_norm_cap"],
+        }, sort_keys=True)
+        return f"btlboost_{base}_{hashlib.md5(fkey_str.encode()).hexdigest()[:6]}"
     fkey_str = json.dumps({
+        "mode": "mul",
         "eps": cfg["btl_fuse_eps"],
         "past": cfg["btl_fuse_past"],
         "fut": cfg["btl_fuse_fut"],
@@ -338,14 +380,6 @@ def btl_act_cache_path(paths, track, stem, cfg):
 
 
 def precompute_btl_activations(items, cfg, paths, device, recompute=False):
-    """
-    Precompute 30 FPS Beat This! Live activations in the main process (GPU-safe) before forking workers.
-    - Offline mode uses BeatThisLiveOffline.
-    - Streaming mode (--btl_streaming) steps BeatThisLiveActivation per 1600-sample hop, which is
-      bit-for-bit identical to RealTimeBeatTracker(activation=BeatThisLiveActivation(...)) since
-      BeatThisLiveActivation does not depend on PLP state and process_with_activation applies the
-      same silence-gate muting as RealTimeBeatTracker.mute_activation_when_inactive.
-    """
     if not cfg.get("btl_ckpt"):
         return
     todo = [(t, s) for (t, s, *_rest) in items
@@ -363,10 +397,13 @@ def precompute_btl_activations(items, cfg, paths, device, recompute=False):
             samplerate=48000,
             H=hop,
             device=device,
+            use_amp=cfg["btl_use_amp"],
+            use_cuda_graph=cfg["btl_use_cuda_graph"],
             context_frames=cfg["btl_context_frames"],
             align_label_shift=cfg["btl_align_shift"],
             target_lead_ms=cfg["btl_target_lead_ms"],
             extra_shift_ms=cfg["btl_extra_shift_ms"],
+            compensate_resampler_latency=True,
             resample_method=cfg["btl_resample_method"],
             downbeat_weight=cfg["btl_downbeat_weight"],
             act_power=cfg["btl_act_power"],
@@ -386,6 +423,7 @@ def precompute_btl_activations(items, cfg, paths, device, recompute=False):
             downbeat_weight=cfg["btl_downbeat_weight"],
             act_power=cfg["btl_act_power"],
             soxr_quality=cfg["btl_soxr_quality"],
+            use_amp=cfg["btl_use_amp"],
         )
         spec = fe.spec
         resamp_ms = float(SOXR_LATENCY_MS_48K_TO_22K.get(cfg["btl_soxr_quality"].upper(), 6.8))
@@ -394,14 +432,14 @@ def precompute_btl_activations(items, cfg, paths, device, recompute=False):
         target_lead_ms=cfg["btl_target_lead_ms"],
         resampler_latency_ms=resamp_ms,
         method=cfg["btl_resample_method"],
-    )
+    ) + min(cfg["btl_extra_shift_ms"], 0.0)
     mode_str = "streaming" if cfg["btl_streaming"] else ("offline-causal-stft" if cfg["btl_causal_stft"] else "offline")
-    print(f"[INFO] Beat This! Live ({mode_str}, soxr={cfg['btl_soxr_quality']}) spec: label_shift={spec.label_shift} "
-          f"(raw pred lead={spec.lead_frames * 20:+.0f} ms, SCLM postprocessor bypassed), "
-          f"sw_window={spec.sw_window}, 30FPS causal_margin={margin_ms:+.2f} ms "
-          f"(target_lead={cfg['btl_target_lead_ms']:+.1f} ms)")
+    print(f"[INFO] Beat This! Live ({mode_str}, soxr={cfg['btl_soxr_quality']}, amp={cfg['btl_use_amp']}) spec: "
+          f"label_shift={spec.label_shift} (raw pred lead={spec.lead_frames * 20:+.0f} ms, SCLM bypassed), "
+          f"sw_window={spec.sw_window}, extra_shift={cfg['btl_extra_shift_ms']:+.1f} ms, "
+          f"30FPS eff_causal_margin={margin_ms:+.2f} ms")
     if margin_ms < 0:
-        print(f"[WARNING] 30FPS causal_margin is NEGATIVE ({margin_ms:+.2f} ms); streaming will clamp!")
+        print(f"[WARNING] 30FPS eff_causal_margin is NEGATIVE ({margin_ms:+.2f} ms); streaming will clamp!")
 
     total_clamped = 0
     for track, stem in tqdm(todo, ncols=140, desc=f"BTL ({mode_str})"):
@@ -441,7 +479,7 @@ def precompute_btl_activations(items, cfg, paths, device, recompute=False):
 
 
 # ----------------------------------------------------------------------------------------------------------
-# Causal Flux x Beat This! Fusion (Step 3, strictly causal, no ground truth)
+# Causal Flux + Beat This! Fusion (strictly causal, bit-for-bit parity with CausalFluxBTLActivation)
 # ----------------------------------------------------------------------------------------------------------
 def compute_causal_flux(mono, sr, hop):
     fps = float(sr) / float(hop)
@@ -455,37 +493,59 @@ def compute_causal_flux(mono, sr, hop):
     return flux
 
 
-def fuse_flux_btl_causal(flux, btl_act, eps=0.05, past_frames=2, fut_frames=0):
-    """
-    Strictly causal gate: at frame n, flux[n] is multiplied by
-        eps + max(btl_act[max(0, n - past_frames) : n + fut_frames + 1])
-    With fut_frames=0 (default), only current and past Beat This! frames are read.
-    """
-    if fut_frames != 0:
-        raise ValueError("btl_fuse_fut must be 0 for strict causal parity with streaming.")
-
+def fuse_flux_btl_causal(
+    flux,
+    btl_act,
+    mode="boost",
+    flux_boost=0.6,
+    flux_ema_alpha=0.01,
+    flux_norm_cap=2.0,
+    eps=0.05,
+    past_frames=2,
+    fut_frames=0,
+):
     flux = np.maximum(np.asarray(flux, dtype=np.float64), 0.0)
     btl = np.maximum(np.asarray(btl_act, dtype=np.float64), 0.0)
     n_len = min(len(flux), len(btl))
+
+    if mode == "none":
+        return btl[:n_len].astype(np.float32)
+
     fused = np.zeros(n_len, dtype=np.float64)
+    if mode == "boost":
+        ema = 0.0
+        for n in range(n_len):
+            f_val = float(flux[n])
+            if f_val > 1e-6:
+                ema = f_val if ema <= 0.0 else (1.0 - flux_ema_alpha) * ema + flux_ema_alpha * f_val
+                f_norm = min(f_val / max(ema, 1e-6), flux_norm_cap)
+            else:
+                f_norm = 0.0
+            fused[n] = btl[n] * (1.0 + flux_boost * f_norm)
+        return fused.astype(np.float32)
+
+    if fut_frames != 0:
+        raise ValueError("btl_fuse_fut must be 0 for strict causal parity with streaming.")
     for n in range(n_len):
-        f_idx = n + fut_frames
-        if f_idx >= n_len:
-            break
         lo = max(0, n - past_frames)
-        hi = min(n_len, f_idx + 1)
+        hi = min(n_len, n + 1)
         gate = float(np.max(btl[lo:hi])) if hi > lo else 0.0
         fused[n] = flux[n] * (eps + gate)
     return fused.astype(np.float32)
 
 
 # ----------------------------------------------------------------------------------------------------------
-# Ground truth
+# Ground truth (prefers beats.tsv matching pre_encode.py, falls back to all_src.mid)
 # ----------------------------------------------------------------------------------------------------------
-def midi_gt(midi_path, times):
-    beats = np.asarray(pretty_midi.PrettyMIDI(str(midi_path)).get_beats(), dtype=np.float64)
+def _beats_to_pos_bpm(beats, beat_positions, times):
+    beats = np.asarray(beats, dtype=np.float64)
+    pos_arr = np.asarray(beat_positions, dtype=np.int32)
     if beats.size < 2:
-        raise ValueError("fewer than 2 beats in MIDI")
+        raise ValueError("fewer than 2 beats in ground truth")
+    order = np.argsort(beats)
+    beats, pos_arr = beats[order], pos_arr[order]
+    keep = np.concatenate([[True], np.diff(beats) > 1e-4])
+    beats, pos_arr = beats[keep], pos_arr[keep]
 
     idx = np.arange(beats.size, dtype=np.float64)
     pos = np.interp(times, beats, idx)
@@ -499,7 +559,34 @@ def midi_gt(midi_path, times):
     smooth_iv = median_filter(intervals, size=5, mode="mirror") if intervals.size >= 5 else intervals
     seg = np.clip(np.searchsorted(beats, times, side="right") - 1, 0, smooth_iv.size - 1)
     bpm = 60.0 / smooth_iv[seg]
-    return beats, pos, bpm
+    return beats, pos_arr, pos, bpm
+
+
+def load_gt(track_dir, times):
+    tsv_path = track_dir / "beats.tsv"
+    midi_path = track_dir / "all_src.mid"
+    if tsv_path.exists():
+        b_times, b_pos = [], []
+        for ln in tsv_path.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            parts = ln.split()
+            b_times.append(float(parts[0]))
+            b_pos.append(int(float(parts[1])) if len(parts) >= 2 else 0)
+        return _beats_to_pos_bpm(b_times, b_pos, times)
+    if midi_path.exists():
+        pm = pretty_midi.PrettyMIDI(str(midi_path))
+        beats = np.sort(np.asarray(pm.get_beats(), dtype=np.float64))
+        downbeats = np.sort(np.asarray(pm.get_downbeats(), dtype=np.float64))
+        b_pos = np.zeros(beats.size, dtype=np.int32)
+        if downbeats.size > 0 and beats.size > 0:
+            j = np.searchsorted(downbeats, beats)
+            lo = downbeats[np.clip(j - 1, 0, downbeats.size - 1)]
+            hi = downbeats[np.clip(j, 0, downbeats.size - 1)]
+            b_pos[np.minimum(np.abs(beats - lo), np.abs(beats - hi)) <= 0.03] = 1
+        return _beats_to_pos_bpm(beats, b_pos, times)
+    raise FileNotFoundError(f"Neither beats.tsv nor all_src.mid found in {track_dir}")
 
 
 def gt_fold_factor(beats, low_bpm):
@@ -514,9 +601,12 @@ def gt_fold_factor(beats, low_bpm):
     return f
 
 
-def folded_beat_times(beats, f, t_max):
+def folded_beat_times(beats, f, t_max, anchor_idx=0.0):
     idx = np.arange(beats.size, dtype=np.float64)
-    x = np.arange(0.0, beats.size - 1 + 1e-9, 1.0 / f)
+    step = 1.0 / f
+    # Anchor halving (f < 1) on the first downbeat so beat 1 stays aligned with phase 0
+    start = anchor_idx % step if f < 1.0 else 0.0
+    x = np.arange(start, beats.size - 1 + 1e-9, step)
     t = np.interp(x, idx, beats)
     return t[t <= t_max]
 
@@ -547,6 +637,7 @@ def build_tracker(cfg, sr):
         silence_db=cfg["silence_db"],
         hold_frames=cfg["hold_frames"],
         conf_threshold=cfg["conf_threshold"],
+        lock_conf_threshold=cfg["lock_conf_threshold"],
         switch_ratio=cfg["switch_ratio"],
         energy_threshold=cfg["energy_threshold"],
         **{k: cfg[k] for k in LOCK_KEYS},
@@ -554,9 +645,6 @@ def build_tracker(cfg, sr):
 
 
 def process_with_activation(tracker, frame, a):
-    """Same as RealTimeBeatTracker.process, but the activation sample `a` replaces the spectral flux.
-    The silence gate (RMS + hold) is the tracker's own, and the injected activation is muted while inactive
-    (matching RealTimeBeatTracker.mute_activation_when_inactive=True)."""
     rms = np.sqrt(np.mean(np.asarray(frame, dtype=np.float64) ** 2))
     tracker.last_rms_db = float(20 * np.log10(rms + 1e-12))
     if tracker.last_rms_db > tracker.silence_db:
@@ -573,7 +661,7 @@ def process_with_activation(tracker, frame, a):
     return tracker.plp.detect_beat(pulse)
 
 
-def run_tracker(mono, sr, cfg, act_override=None):
+def run_tracker(mono, sr, cfg, act_override=None, phase_lead_ms=0.0):
     hop = int(cfg["hop"])
     if sr != 48000:
         raise ValueError(f"tracker expects sr=48000, got {sr}")
@@ -585,6 +673,7 @@ def run_tracker(mono, sr, cfg, act_override=None):
 
     tracker = build_tracker(cfg, sr)
     cs = tracker.cs
+    phase_lead_sec = float(phase_lead_ms) / 1000.0
 
     sin_ = np.zeros(n_model, dtype=np.float32)
     cos_ = np.zeros(n_model, dtype=np.float32)
@@ -606,8 +695,12 @@ def run_tracker(mono, sr, cfg, act_override=None):
             lfo_[n] = cs.gamma_lfo
         else:
             flag_[n] = process_with_activation(tracker, frame, act_override[n])
-        sin_[n] = cs.beat_sin
-        cos_[n] = cs.beat_cos
+
+        ph = cs.beat_phase
+        if ph is not None and phase_lead_sec != 0.0 and cs.tempo_bpm > 0.0:
+            ph = (ph + phase_lead_sec * cs.tempo_bpm / 60.0) % 1.0
+        sin_[n] = 0.0 if ph is None else float(np.sin(2.0 * np.pi * ph))
+        cos_[n] = 0.0 if ph is None else float(np.cos(2.0 * np.pi * ph))
         tempo_[n] = cs.tempo_bpm
         conf_[n] = tracker.plp.last_confidence
         trusted_[n] = tracker.plp.last_trusted
@@ -629,7 +722,6 @@ def run_tracker(mono, sr, cfg, act_override=None):
 
 
 def make_oracle_activation(gt_beats, n_frames, fps, amp, jitter_ms, seed):
-    """Gaussian bumps at the GT beats. Frame n is centred at n / fps (STFT window of 2 hops, centre = n * hop)."""
     rng = np.random.default_rng(seed)
     tb = np.asarray(gt_beats, dtype=np.float64)
     if jitter_ms > 0:
@@ -688,7 +780,6 @@ def build_run(tr, cfg, fps, lead_sec=0.0):
 
 
 def onset_peaks(act, fps, lead_sec=0.0):
-    """Peaks of the activation with parabolic sub-frame refinement. Times use n / fps + lead_sec."""
     a = np.asarray(act, dtype=np.float64)
     if a.size < 3 or a.max() <= 0:
         return np.array([]), np.array([])
@@ -706,7 +797,8 @@ def onset_peaks(act, fps, lead_sec=0.0):
 
 
 def prepare_track(track, stem, cfg, paths, recompute=False):
-    y, sr = sf.read(str(paths["data"] / track / f"{stem}.wav"), dtype="float32", always_2d=True)
+    track_dir = paths["data"] / track
+    y, sr = sf.read(str(track_dir / f"{stem}.wav"), dtype="float32", always_2d=True)
     mono = y.mean(axis=1).astype(np.float64)
 
     btl_act = None
@@ -717,11 +809,16 @@ def prepare_track(track, stem, cfg, paths, recompute=False):
         if not btl_p.exists():
             raise FileNotFoundError(f"BTL activation cache missing: {btl_p}")
         btl_act = np.load(btl_p)["act"]
-        if cfg.get("btl_fuse_flux"):
+        mode = cfg.get("btl_fusion_mode", "boost")
+        if mode != "none":
             flux = compute_causal_flux(mono, sr, int(cfg["hop"]))
             btl_act = fuse_flux_btl_causal(
                 flux,
                 btl_act,
+                mode=mode,
+                flux_boost=cfg["btl_flux_boost"],
+                flux_ema_alpha=cfg["btl_flux_ema_alpha"],
+                flux_norm_cap=cfg["btl_flux_norm_cap"],
                 eps=cfg["btl_fuse_eps"],
                 past_frames=cfg["btl_fuse_past"],
                 fut_frames=cfg["btl_fuse_fut"],
@@ -731,31 +828,31 @@ def prepare_track(track, stem, cfg, paths, recompute=False):
         btl_tag = btl_run_sig(cfg)
         tr = load_or_compute(
             cache_path(paths, track, stem, btl_cfg, btl_tag),
-            lambda: run_tracker(mono, sr, btl_cfg, act_override=btl_act),
+            lambda: run_tracker(mono, sr, btl_cfg, act_override=btl_act,
+                                phase_lead_ms=btl_cfg["phase_lead_ms"]),
             REQ_KEYS, recompute,
         )
         primary_lead_sec = btl_lead_sec
     else:
         tr = load_or_compute(
             cache_path(paths, track, stem, cfg, "real"),
-            lambda: run_tracker(mono, sr, cfg),
+            lambda: run_tracker(mono, sr, cfg, phase_lead_ms=cfg["phase_lead_ms"]),
             REQ_KEYS, recompute,
         )
         primary_lead_sec = 0.0
-
-    midi = paths["data"] / track / "all_src.mid"
-    if not midi.exists():
-        raise FileNotFoundError("all_src.mid missing")
 
     fps = float(tr["fps"])
     num_frames = int(tr["num_frames"])
     frame_times = np.arange(num_frames) / fps + cfg["pk_offset_frames"] / fps + primary_lead_sec
     duration = len(mono) / sr
 
-    beats, pos, bpm = midi_gt(midi, frame_times)
+    beats, beat_positions, pos, bpm = load_gt(track_dir, frame_times)
     fold = gt_fold_factor(beats, cfg["low_bpm"])
-    pos, bpm = pos * fold, bpm * fold
-    gt_beats = clean_beats(folded_beat_times(beats, fold, duration), duration)
+    db_indices = np.flatnonzero(beat_positions == 1)
+    db0 = float(db_indices[0]) if db_indices.size > 0 else 0.0
+    pos = (pos - db0) * fold if fold < 1.0 else pos * fold
+    bpm = bpm * fold
+    gt_beats = clean_beats(folded_beat_times(beats, fold, duration, anchor_idx=db0), duration)
     ang = 2.0 * np.pi * pos
 
     runs = {"real": build_run(tr, cfg, fps, lead_sec=primary_lead_sec)}
@@ -764,14 +861,16 @@ def prepare_track(track, stem, cfg, paths, recompute=False):
         btl_tag = btl_run_sig(cfg)
         tr_btl = load_or_compute(
             cache_path(paths, track, stem, btl_cfg, btl_tag),
-            lambda: run_tracker(mono, sr, btl_cfg, act_override=btl_act),
+            lambda: run_tracker(mono, sr, btl_cfg, act_override=btl_act,
+                                phase_lead_ms=btl_cfg["phase_lead_ms"]),
             REQ_KEYS, recompute,
         )
         runs["btl"] = build_run(tr_btl, cfg, fps, lead_sec=btl_lead_sec)
 
-    # Under unfused --btl_primary, BTL probabilities are sparse (p95 can be near 0), so use unit amplitude
-    # for oracle bumps so the oracle stays above energy_threshold cleanly.
-    if cfg.get("btl_primary") and not cfg.get("btl_fuse_flux"):
+    # Oracle runs stay strictly unshifted (phase_lead_ms=0.0) so oracle measures pure back-end bias
+    orc_cfg = dict(cfg)
+    orc_cfg["phase_lead_ms"] = 0.0
+    if cfg.get("btl_primary") and cfg.get("btl_fusion_mode", "boost") in ("none", "boost"):
         amp = 1.0
     else:
         amp = float(np.percentile(tr["act"], 95))
@@ -782,10 +881,10 @@ def prepare_track(track, stem, cfg, paths, recompute=False):
 
         def compute(j=j):
             act = make_oracle_activation(gt_beats, num_frames, fps, amp, j, seed0)
-            return run_tracker(mono, sr, cfg, act_override=act)
+            return run_tracker(mono, sr, orc_cfg, act_override=act, phase_lead_ms=0.0)
 
         runs[name] = build_run(
-            load_or_compute(cache_path(paths, track, stem, cfg, name), compute, REQ_KEYS, recompute),
+            load_or_compute(cache_path(paths, track, stem, orc_cfg, name), compute, REQ_KEYS, recompute),
             cfg, fps, lead_sec=0.0,
         )
 
@@ -810,7 +909,6 @@ def fmeas(g, e, tol):
 
 
 def nearest_offsets(ref, x):
-    """Signed offset of every x to its nearest ref (both sorted, ref non-empty)."""
     j = np.searchsorted(ref, x)
     lo = ref[np.clip(j - 1, 0, ref.size - 1)]
     hi = ref[np.clip(j, 0, ref.size - 1)]
@@ -831,8 +929,6 @@ def level_variants(g):
 
 
 def event_metrics(gt, est, t0, t1, prefix, sweep=False, light=False):
-    """Returns (metrics dict, signed offsets in ms, shift-sweep F70 curve or None).
-    light=True skips the expensive extras (CML/AML/Cemgil, metrical variants)."""
     g = gt[(gt >= t0) & (gt < t1)]
     e = est[(est >= t0) & (est < t1)]
     fk = [fkey(t) for t in TOLS]
@@ -894,7 +990,6 @@ def event_metrics(gt, est, t0, t1, prefix, sweep=False, light=False):
 
 
 def region_hits(gt, est, active, fps, t0, t1, tol=0.07):
-    """Hit rate (nearest predicted beat within tol) of GT beats in silence / just after an entry / steady state."""
     out = {}
     for r in REGIONS:
         out[f"hit70_{r}"] = np.nan
@@ -932,7 +1027,6 @@ def acquisition_metrics(gt, est, tol=0.07, run=4):
 
 
 def frontend_metrics(onsets, act, fps, gt, t0, t1, lead_sec=0.0):
-    """Primary activation peaks vs GT beats (no tracker involved)."""
     keys = ["onsets_per_beat", "onset_rec50", "onset_rec100", "onset_prec100",
             "act_off_med_ms", "act_off_mad_ms", "beat_act_ratio"]
     out = {k: np.nan for k in keys}
@@ -1247,7 +1341,6 @@ def med_col(df, c):
 
 
 def best_shift(curve):
-    """(shift_ms, F70) at the centre of the plateau of the sweep maximum (argmax alone picks a plateau edge)."""
     top = float(np.max(curve))
     idx = np.flatnonzero(curve >= top - 1e-6)
     sh = SHIFTS_MS[idx]
@@ -1268,12 +1361,7 @@ def summarize(trk, win, cfg, agg):
     orcs = oracle_names(cfg)
     orc0 = orcs[0] if orcs else None
     has_btl_cmp = "btl_F70" in trk.columns
-    if cfg.get("btl_primary"):
-        ckpt_stem = pathlib.Path(cfg["btl_ckpt"]).stem
-        primary_label = f"Flux x Beat This! Live ({ckpt_stem})" if cfg.get("btl_fuse_flux") \
-            else f"Beat This! Live ({ckpt_stem})"
-    else:
-        primary_label = "spectral flux"
+    primary_label = btl_mode_label(cfg, short=False) if cfg.get("btl_primary") else "spectral flux"
 
     P(f"=== Track-level summary ({len(trk)} tracks/stems, {len(win)} windows | primary: {primary_label}) ===")
     cols = ["pk_F70", "pk_F200", "pk_AMLt", "pk_CMLt", "flag_F70", "plv", "plv_k1", "phase_std_deg",
@@ -1284,7 +1372,6 @@ def summarize(trk, win, cfg, agg):
     cols = [c for c in cols if c in trk.columns]
     P(trk[cols].agg(["mean", "median"]).T.round(3).to_string())
 
-    # ---- A/B: where does the F70 gap come from -----------------------------------------------------------
     P("\n=== Gap decomposition (mean over tracks) ===")
     rows = [(f"F70  primary tracker ({primary_label})", mean_col(trk, "pk_F70"))]
     sw = agg["sweep"].get("pk")
@@ -1296,8 +1383,7 @@ def summarize(trk, win, cfg, agg):
              ("F100 primary tracker as is", mean_col(trk, "pk_F100")),
              ("F200 primary tracker as is", mean_col(trk, "pk_F200"))]
     if has_btl_cmp:
-        btl_name = pathlib.Path(cfg["btl_ckpt"]).stem
-        tag_lbl = f"Flux x BTL [{btl_name}]" if cfg.get("btl_fuse_flux") else f"Beat This! Live [{btl_name}]"
+        tag_lbl = btl_mode_label(cfg, short=True)
         rows.append((f"F70  {tag_lbl}", mean_col(trk, "btl_F70")))
         sw_btl = agg["sweep"].get("btl")
         if sw_btl is not None:
@@ -1311,7 +1397,6 @@ def summarize(trk, win, cfg, agg):
     for lab, v in rows:
         P(f"  {lab:<62s} {v:6.3f}")
 
-    # ---- latency / jitter ---------------------------------------------------------------------------------
     real_off, real_mad = med_col(trk, "pk_off_med_ms"), med_col(trk, "pk_off_mad_ms")
     P("\n=== Timing: bias vs jitter (signed, > 0 = tracker late) ===")
     P(f"  primary : per-track median offset (bias)   {real_off:+7.1f} ms | per-track MAD (jitter) {real_mad:6.1f} ms "
@@ -1337,11 +1422,8 @@ def summarize(trk, win, cfg, agg):
               f"(pk_offset_frames now {cfg['pk_offset_frames']:.2f}; a pure relabel would be "
               f"{cfg['pk_offset_frames'] - o_off / frame_ms:.2f})")
     if np.isfinite(real_off):
-        P(f"  Compensation for the downstream model (removes the global bias): "
-          f"beat_phase_corrected = (beat_phase + {real_off / 1000.0:.4f} s * tempo_bpm / 60) % 1")
-        P("  (changing `PLP.lookahead` does NOT remove it: the event time is cursor-relative, so lookahead cancels.)")
+        P(f"  Residual phase lead to reach 0 ms: add {real_off:+.1f} ms to phase_lead_ms")
 
-    # ---- front end ----------------------------------------------------------------------------------------
     P(f"\n=== Front end ({primary_label} peaks vs GT beats, no tracker involved) ===")
     for lab, c in [("onsets per GT beat", "onsets_per_beat"), ("GT beats with an onset within 50 ms", "onset_rec50"),
                    ("GT beats with an onset within 100 ms", "onset_rec100"),
@@ -1351,7 +1433,6 @@ def summarize(trk, win, cfg, agg):
                    ("onset offset MAD (ms)", "act_off_mad_ms")]:
         P(f"  {lab:<50s} mean {mean_col(trk, c):8.3f}   median {med_col(trk, c):8.3f}")
 
-    # ---- regions / acquisition ------------------------------------------------------------------------------
     P("\n=== GT-beat hit rate (<= 70 ms) by input region ===")
     for r in REGIONS:
         c, n = f"hit70_{r}", f"n_{r}"
@@ -1365,7 +1446,6 @@ def summarize(trk, win, cfg, agg):
     P(f"  time to first 4 consecutive hits: median {med_col(trk, 'acq_sec'):.1f} s | "
       f"hit rate after acquisition {mean_col(trk, 'hit70_post_acq'):.3f}")
 
-    # ---- tempo ---------------------------------------------------------------------------------------------
     P("\n=== Tempo ===")
     P(f"  acc1 {mean_col(trk, 'tempo_acc1'):.3f} | acc2 (octave-tolerant) {mean_col(trk, 'tempo_acc2'):.3f} | "
       f"median |err| {med_col(trk, 'tempo_med_abs_err_pct'):.2f} % | jumps/min {mean_col(trk, 'tempo_jumps_per_min'):.2f}")
@@ -1397,7 +1477,6 @@ def summarize(trk, win, cfg, agg):
                 if c in trk.columns]
         P(trk.groupby(grp)[keep].agg(["mean", "count"]).round(3).to_string())
 
-    # ---- taxonomy ----------------------------------------------------------------------------------------
     for name, df in (("windows", win), ("tracks", trk)):
         if not len(df) or "cause" not in df.columns:
             continue
@@ -1412,7 +1491,6 @@ def summarize(trk, win, cfg, agg):
             P(f"\n  non-ok {name} by cause x blame (front-end = oracle F70 >= {cfg['ok_f']}, back-end = oracle also fails):")
             P(pd.crosstab(bad["cause"], bad["blame"]).to_string())
 
-    # ---- hints ---------------------------------------------------------------------------------------------
     P("\n=== Reading guide (automatic hints, check against the plots) ===")
     r70 = mean_col(trk, "pk_F70")
     if has_btl_cmp:
@@ -1423,24 +1501,13 @@ def summarize(trk, win, cfg, agg):
         if o70 - r70 > 0.15:
             P(f"  * Perfect onsets lift F70 {r70:.2f} -> {o70:.2f}: the activation / onset side is the main limiter.")
         elif o70 < 0.8:
-            P(f"  * Even perfect onsets only reach F70 {o70:.2f}: the back-end (tempo logic, lock/PLL, read-out or time "
-              f"convention) loses accuracy by itself.")
+            P(f"  * Even perfect onsets only reach F70 {o70:.2f}: the back-end loses accuracy by itself.")
         else:
             P(f"  * Oracle F70 {o70:.2f} is close to the primary {r70:.2f}: the onsets are not what limits F70.")
         if len(orcs) > 1:
-            P(f"  * Oracle with {orcs[1]} ms-style jitter: F70 {mean_col(trk, f'{orcs[1]}_F70'):.2f} "
-              f"(shows how much expressive timing alone costs).")
+            P(f"  * Oracle with {orcs[1]} ms-style jitter: F70 {mean_col(trk, f'{orcs[1]}_F70'):.2f}.")
     if sw is not None and float(np.max(sw)) - r70 > 0.05:
-        P(f"  * A single global shift of {best_shift(sw)[0]:+d} ms lifts F70 {r70:.2f} -> "
-          f"{float(np.max(sw)):.2f}: a constant latency is a cheap fix.")
-    if mean_col(trk, "pk_F200") - r70 > 0.2 and mean_col(trk, "pk_F70_debias") - r70 < 0.1:
-        P("  * F200 >> F70 and de-biasing does not help: timing JITTER (phase read-out / syncopation), not a constant lag.")
-    rec50 = mean_col(trk, "onset_rec50")
-    if np.isfinite(rec50) and rec50 < 0.5:
-        P(f"  * Only {rec50:.0%} of GT beats have an onset within 50 ms: the guitar is sparse/syncopated, so the beat "
-          f"must be inferred from the pattern; a better onset detector alone will not fix this.")
-    if np.isfinite(med_col(trk, "act_off_mad_ms")) and med_col(trk, "act_off_mad_ms") > 25:
-        P("  * Onset-to-beat spread is large even before the tracker; expect a hard ceiling on F70.")
+        P(f"  * A single global shift of {best_shift(sw)[0]:+d} ms lifts F70 {r70:.2f} -> {float(np.max(sw)):.2f}.")
     return "\n".join(out)
 
 
@@ -1502,11 +1569,8 @@ def summary_plot(trk, win, offs_pk, path, frame_ms, cfg):
 def diagnosis_plot(trk, win, agg, path, cfg):
     orcs = oracle_names(cfg)
     names = ["pk"] + compare_names(cfg)
-    if cfg.get("btl_primary"):
-        pk_lab = "Flux x Beat This! Live" if cfg.get("btl_fuse_flux") else "Beat This! Live"
-    else:
-        pk_lab = "spectral flux"
-    btl_lab = "Flux x Beat This! Live" if cfg.get("btl_fuse_flux") else "Beat This! Live"
+    pk_lab = btl_mode_label(cfg, short=True) if cfg.get("btl_primary") else "spectral flux"
+    btl_lab = btl_mode_label(cfg, short=True)
     labels = {"pk": pk_lab, "btl": btl_lab, **{n: f"oracle ({n})" for n in orcs}}
     colors = {"pk": "tab:red", "btl": "tab:green",
               **{n: c for n, c in zip(orcs, ["tab:blue", "tab:cyan", "tab:purple"])}}
@@ -1518,14 +1582,14 @@ def diagnosis_plot(trk, win, agg, path, cfg):
         axs[0, 0].plot(ms, ys, "o-", color=colors[n], label=labels[n])
     axs[0, 0].axvline(70, color="k", lw=0.6, ls=":")
     axs[0, 0].set_xlabel("tolerance (ms)"); axs[0, 0].set_ylabel("mean F")
-    axs[0, 0].set_title("F-measure vs tolerance (big gap 70 -> 200 = timing, not tempo)"); axs[0, 0].legend()
+    axs[0, 0].set_title("F-measure vs tolerance"); axs[0, 0].legend()
 
     for n in names:
         if agg["sweep"].get(n) is not None:
             axs[0, 1].plot(SHIFTS_MS, agg["sweep"][n], color=colors[n], label=labels[n])
     axs[0, 1].axvline(0, color="k", lw=0.6)
     axs[0, 1].set_xlabel("shift added to predicted beats (ms)"); axs[0, 1].set_ylabel("mean F70")
-    axs[0, 1].set_title("Global shift sweep (peak away from 0 = fixable latency)"); axs[0, 1].legend()
+    axs[0, 1].set_title("Global shift sweep"); axs[0, 1].legend()
 
     bins = np.linspace(-150, 150, 61)
     hist_names = ["pk"] + (["btl"] if "btl" in names else []) + (orcs[:1] if orcs else [])
@@ -1619,15 +1683,12 @@ def render_window(row, cfg, paths, tag, rank):
     fig, axs = plt.subplots(5, 1, figsize=(16, 14), sharex=True, height_ratios=[1.4, 1, 1, 0.8, 0.9])
 
     axs[0].plot(t_axis, crop / (np.abs(crop).max() + 1e-9), color="lightgray", label="guitar waveform")
-    axs[0].vlines(gt_in, 0, 1.1, color="green", lw=2, label="GT beats (MIDI, folded)")
-    if cfg.get("btl_primary"):
-        pk_lab = "Flux x Beat This! Live beats" if cfg.get("btl_fuse_flux") else "Beat This! Live beats"
-    else:
-        pk_lab = "tracker beats"
+    axs[0].vlines(gt_in, 0, 1.1, color="green", lw=2, label="GT beats (folded)")
+    pk_lab = f"{btl_mode_label(cfg, short=True)} beats" if cfg.get("btl_primary") else "tracker beats"
     axs[0].vlines(pk_in, -1.1, -0.55, color="red", lw=2, ls="--", label=pk_lab)
     if btl is not None:
-        btl_ev_lab = "Flux x BTL beats" if cfg.get("btl_fuse_flux") else "Beat This! Live beats"
-        axs[0].vlines(btl_in, -0.55, -0.15, color="tab:green", lw=2, ls="-.", label=btl_ev_lab)
+        axs[0].vlines(btl_in, -0.55, -0.15, color="tab:green", lw=2, ls="-.",
+                      label=f"{btl_mode_label(cfg, short=True)} beats")
     if orc is not None:
         y_lo = -0.15 if btl is not None else -0.5
         axs[0].vlines(orc_in, y_lo, 0, color="tab:blue", lw=2, ls=":", label=f"oracle beats ({orc_names[0]})")
@@ -1639,7 +1700,7 @@ def render_window(row, cfg, paths, tag, rank):
                      f"{_fmt(row.get(f'{orc_names[0]}_F70', np.nan) if orc_names else np.nan)} | "
                      f"PLV={_fmt(row['plv'])} (native {_fmt(row['plv_k1'])}) active={_fmt(row['active_frac'])}")
 
-    axs[1].plot(ft[m], P["gt_cos"][m], color="green", label="GT cos (MIDI)")
+    axs[1].plot(ft[m], P["gt_cos"][m], color="green", label="GT cos")
     axs[1].plot(ft[m], R["cos"][m], color="red", ls="--", label="primary cos")
     axs[1].plot(ft[m], P["gt_sin"][m], color="green", lw=0.8, ls=":", alpha=0.7, label="GT sin")
     axs[1].plot(ft[m], R["sin"][m], color="red", lw=0.8, ls=":", alpha=0.7, label="primary sin")
@@ -1665,6 +1726,7 @@ def render_window(row, cfg, paths, tag, rank):
 
     axs[3].plot(ft[m], R["conf"][m], color="orange", lw=1.2, label="conf (Peak/Mean Ratio)")
     axs[3].axhline(cfg["conf_threshold"], color="orange", ls="--", alpha=0.5, label="conf threshold")
+    axs[3].axhline(cfg["lock_conf_threshold"], color="red", ls=":", alpha=0.6, label="lock conf threshold")
     axs[3].set_ylabel("conf"); axs[3].legend(loc="upper left")
     ax3b = axs[3].twinx()
     ax3b.plot(ft[m], R["lock_score"][m], color="tab:blue", lw=1.2, label="lock score (0 to 1)")
@@ -1674,11 +1736,8 @@ def render_window(row, cfg, paths, tag, rank):
     m30 = (t30 >= t0) & (t30 < t1)
     a = np.asarray(P["act"], dtype=np.float64)
     ref = max(float(np.percentile(a, 99)), 1e-9)
-    if cfg.get("btl_primary"):
-        act_lab = "beat activation (Flux x BTL, / p99)" if cfg.get("btl_fuse_flux") \
-            else "beat activation (Beat This! Live, / p99)"
-    else:
-        act_lab = "beat activation (spectral flux, / p99)"
+    act_lab = f"beat activation ({btl_mode_label(cfg, short=True)}, / p99)" if cfg.get("btl_primary") \
+        else "beat activation (spectral flux, / p99)"
     axs[4].plot(t30[m30], a[m30] / ref, color="purple", lw=0.8, label=act_lab)
     axs[4].vlines(gt_in, 0, 1.0, color="green", lw=1, alpha=0.6, label="GT beats")
     if on_in.size:
@@ -1706,7 +1765,10 @@ def main():
     paths["out"].mkdir(parents=True, exist_ok=True)
     paths["cache"].mkdir(parents=True, exist_ok=True)
     cfg = load_cfg(args)
-    print(f"[INFO] Tracker settings: { {k: cfg[k] for k in TRACKER_KEYS} } features={cfg['features']}")
+    eff_cfg = btl_tracker_cfg(cfg) if cfg.get("btl_primary") else cfg
+    print(f"[INFO] Effective primary tracker settings: { {k: eff_cfg[k] for k in TRACKER_KEYS} } "
+          f"btl_fusion={cfg['btl_fusion_mode']} (boost={cfg['btl_flux_boost']}, "
+          f"extra_shift_ms={cfg['btl_extra_shift_ms']:+.1f})")
     print(f"[INFO] time convention: pk_offset_frames={cfg['pk_offset_frames']}, "
           f"flag_offset_frames={cfg['flag_offset_frames']}, compare runs={compare_names(cfg) or 'off'}")
 
@@ -1728,7 +1790,6 @@ def main():
              for gp in sorted((paths["data"] / t).glob("guitar_*.wav"))]
     print(f"[INFO] Evaluating {len(items)} guitar stems ({args.num_workers} workers).")
 
-    # Precompute BTL activations in the main process before spawning worker processes (GPU-safe)
     if cfg.get("btl_ckpt"):
         precompute_btl_activations(items, cfg, paths, args.btl_device, recompute=args.btl_recompute_act)
 

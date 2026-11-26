@@ -10,10 +10,11 @@ License:     MIT License (https://opensource.org/licenses/MIT)
 Local modifications
   * ControlSignals exposes beat_phase / beat_sin / beat_cos / tempo_bpm, read from the current PLP kernel
     (valid in the trusted AND the flywheel branch).
-  * Acquire -> lock -> re-acquire state machine in PredominantLocalPulse with coherent out-of-gate
-    phase recovery and post-silence phase re-entry (strictly per-frame and causal).
-  * Time convention of the pulse read-out: the tracker runs one step per 30 FPS hop. The newest activation is
-    at buffer index N//2 - 1 and the read cursor is N//2 + lookahead. `lookahead` is in TRACKER frames.
+  * Acquire -> lock -> re-acquire state machine in PredominantLocalPulse with:
+      - clean unlock reset (_confident_once = False) so failed tempos do not block re-acquisition
+      - acquire_min_active_sec + lock_conf_threshold gating preventing premature wrong-tempo locks
+      - candidate count decay during weak/inactive frames
+      - faster, clamped post-silence & coherent out-of-gate phase recovery (strictly per-frame and causal)
   * RealTimeBeatTracker accepts any pluggable causal activation frontend (e.g., BeatThisLiveActivation,
     CausalFluxBTLActivation) with optional silence gating on the activation sent to Tempogram.
 """
@@ -50,8 +51,8 @@ class BeatActivation:
     gamma: int = 1000  # parameter for logarithmic compression
     M: int = 10  # size of half centric local average window (no future values)
 
-    _window_buffer: np.ndarray = field(init=False, repr=False)  # of size N samples
-    _la_buffer: np.ndarray = field(init=False, repr=False)  # of size M frames
+    _window_buffer: np.ndarray = field(init=False, repr=False)
+    _la_buffer: np.ndarray = field(init=False, repr=False)
     _Y_last: np.ndarray = field(init=False, repr=False)
     _stft_window: np.ndarray = field(init=False, repr=False)
 
@@ -61,9 +62,7 @@ class BeatActivation:
         self._window_buffer = np.zeros(self.N)
         self._la_buffer = np.zeros(self.M)
         self.activation_frame = np.array([])
-        # Initialize last spectrogram slice with zeros (matches librosa.stft output shape: 1 + N/2)
         self._Y_last = np.zeros((self.N // 2 + 1, 1))
-        # Pre-compute the STFT window for exact librosa numerical parity (fftbins=True)
         self._stft_window = signal.get_window("hann", self.N, fftbins=True)
 
     def reset(self) -> None:
@@ -75,21 +74,14 @@ class BeatActivation:
 
     def process(self, audio_frame: np.ndarray) -> np.ndarray:
         """Process input frame to output frame."""
-        # STFT
         X_frame = self.stft(audio_frame)
-        # Spectrogram
         Y_frame = self.spectrogram(X_frame)
-        # Novelty (Discrete Derivative)
         Y_diff = Y_frame - self._Y_last
-        Y_diff[Y_diff < 0] = 0  # Half-Wave Rectification
-        nov = np.sum(Y_diff, axis=0)  # Accumulation
-        # store last spectrogram Y_frame
+        Y_diff[Y_diff < 0] = 0
+        nov = np.sum(Y_diff, axis=0)
         self._Y_last = Y_frame
-        # local average
         la = self.local_average(nov)
-        # normalization
         nov_norm = self.normalization(nov, la)
-        # store current activation frame
         if nov_norm.size == 0:
             self.activation_frame = np.array([0.0])
         else:
@@ -97,31 +89,24 @@ class BeatActivation:
         return nov_norm
 
     def stft(self, audio_frame):
-        """Process audio frame and compute STFT."""
         self.roll_window_buffer(audio_frame)
         X_frame = np.fft.rfft(self._window_buffer * self._stft_window)
         return X_frame.reshape(-1, 1)
 
     def spectrogram(self, X_frame):
-        """Compute online spectrogram."""
-        Y_frame = np.log(1 + self.gamma * np.abs(X_frame))
-        return Y_frame
+        return np.log(1 + self.gamma * np.abs(X_frame))
 
     def roll_window_buffer(self, audio_frame):
-        """Roll window_buffer with new audio_frame input."""
         self._window_buffer = np.roll(self._window_buffer, -self.H)
         self._window_buffer[-self.H :] = audio_frame
 
     def local_average(self, nov):
-        """Compute the local average."""
         if len(nov) > 0:
             self._la_buffer = np.roll(self._la_buffer, -1)
             self._la_buffer[-1] = nov[0]
-        la = (1 / self.M) * np.sum(self._la_buffer)
-        return la
+        return (1 / self.M) * np.sum(self._la_buffer)
 
     def normalization(self, nov, la):
-        """Normalized novelty curve. Post-processing step."""
         nov_norm = nov - la
         nov_norm[nov_norm < 0] = 0
         return nov_norm
@@ -235,26 +220,29 @@ class PredominantLocalPulse:
     H: int = field(default=1, repr=False)
     energy_threshold: float = 0.05
     conf_threshold: float = 1.6
+    lock_conf_threshold: float = 1.8
     switch_ratio: float = 1.3
-    switch_persist_sec: float = 2.0
-    harmonic_weight: float = 0.5
+    switch_persist_sec: float = 1.5
+    harmonic_weight: float = 0.0
+    acquire_min_active_sec: float = 2.0
 
     lock_enable: bool = True
-    lock_sec: float = 3.0
-    lock_tol_bpm: float = 4.0
+    lock_sec: float = 2.0
+    lock_tol_bpm: float = 3.0
     lose_rho: float = 0.5
     lose_conf: float = 1.15
     lose_err: float = 0.4
     phase_gate: float = 0.25
-    reacquire_sec: float = 3.5
+    reacquire_sec: float = 3.0
     pll_tau_sec: float = 1.5
     pll_conf_hi: float = 3.0
 
-    relock_sec: float = 3.0
+    relock_sec: float = 2.5
     relock_coh: float = 0.55
     relock_min_w: float = 0.15
-    resume_gate_sec: float = 2.0
-    silence_reopen_sec: float = 2.0
+    resume_gate_sec: float = 3.0
+    silence_reopen_sec: float = 1.5
+    resume_gain: float = 3.0
 
     stability: float = field(default=0, init=False, repr=False)
     current_tempo: float = field(default=0, init=False, repr=False)
@@ -266,6 +254,7 @@ class PredominantLocalPulse:
 
     _has_locked_tempo: bool = field(default=False, init=False, repr=False)
     _confident_once: bool = field(default=False, init=False, repr=False)
+    _active_acquire_frames: int = field(default=0, init=False, repr=False)
     _extrapolated_phase: float = field(default=0.0, init=False, repr=False)
     _decay_factor: float = field(default=1.0, init=False, repr=False)
 
@@ -360,6 +349,7 @@ class PredominantLocalPulse:
         self.last_confidence = float(confidence)
 
         confident = bool(confidence > self.conf_threshold)
+        confident_lock = bool(confidence > max(self.conf_threshold, self.lock_conf_threshold))
         trusted = bool(
             active
             and peak_energy > self.energy_threshold
@@ -374,9 +364,11 @@ class PredominantLocalPulse:
                 return self._pulse_buffer
 
         if trusted:
-            self._step_acquire(tempogram_frame, tempogram, confident)
+            self._active_acquire_frames += 1
+            self._step_acquire(tempogram_frame, tempogram, confident, confident_lock)
 
         elif self._has_locked_tempo and self.current_tempo > 0:
+            self._cand_count = max(self._cand_count - 1, 0)
             self._decay_factor *= 0.995 ** (30.0 / self.framerate)
 
             omega = (self.current_tempo / 60) / self.framerate
@@ -405,6 +397,7 @@ class PredominantLocalPulse:
             self._pulse_buffer += kernel.x
 
         else:
+            self._cand_count = max(self._cand_count - 1, 0)
             self.current_tempo = 0.0
             self.current_kernel = Kernel(
                 n=0, k=0, tempo=0, omega=0.0, c=0.0, phase=0.0,
@@ -413,10 +406,14 @@ class PredominantLocalPulse:
 
         return self._pulse_buffer
 
-    def _step_acquire(self, tempogram_frame, tempogram, confident):
+    def _step_acquire(self, tempogram_frame, tempogram, confident, confident_lock=None):
+        if confident_lock is None:
+            confident_lock = confident
+
         k_best = self._k_peak
         k = k_best
 
+        # Only enforce tempo-switch inertia once enough active frames have populated the tempogram
         if self._confident_once and self._has_locked_tempo and self.current_tempo > 0:
             k_cur = int(np.argmin(np.abs(self.Theta - self.current_tempo)))
             if abs(self.Theta[k_best] - self.current_tempo) > self.lock_tol_bpm:
@@ -452,16 +449,21 @@ class PredominantLocalPulse:
         self._extrapolated_phase = kernel.phase
         self.current_kernel = kernel
         self._pulse_buffer += kernel.x
-        if confident:
+
+        warm = self._active_acquire_frames >= self.acquire_min_active_sec * self.framerate
+        if confident and warm:
             self._confident_once = True
 
-        if self.lock_enable and confident:
+        # Require warm tempogram + stricter lock confidence before counting toward lock
+        if self.lock_enable and warm and confident_lock:
             if abs(kernel.tempo - self._cand_bpm) <= self.lock_tol_bpm:
                 self._cand_count += 1
             else:
                 self._cand_bpm, self._cand_count = float(kernel.tempo), 1
             if self._cand_count >= self.lock_sec * self.framerate:
                 self._enter_lock(tempogram, k, kernel)
+        elif self.lock_enable:
+            self._cand_count = max(self._cand_count - 1, 0)
 
     def _enter_lock(self, tempogram, k, kernel):
         bpm = float(self.Theta[k])
@@ -523,7 +525,7 @@ class PredominantLocalPulse:
                 and abs(err_coh) > self.phase_gate
             )
             resuming = self._resume_frames > 0
-            if resuming:
+            if resuming and evidence >= 0.15:
                 self._resume_frames -= 1
 
             use_coh = persist and (np.cos(2.0 * np.pi * (err - err_coh)) > 0.0)
@@ -537,10 +539,10 @@ class PredominantLocalPulse:
                 self._lock_bpm = float(np.clip(omega * 60.0 * fps, lo, hi))
                 omega = self._lock_bpm / 60.0 / fps
             elif use_coh or resuming:
-                # Out-of-gate recovery: glide phase smoothly without bending tempo.
-                # use_coh ensures a decaying _relock_z cannot push against the current err.
+                # Faster, clamped out-of-gate recovery: glides phase back smoothly without bending tempo
                 step_err = err_coh if use_coh else err
-                self._theta = (self._theta + a * evidence * step_err) % 1.0
+                step = float(np.clip(a * self.resume_gain * evidence * step_err, -0.15, 0.15))
+                self._theta = (self._theta + step) % 1.0
 
         if gate:
             rho = float(tempogram[k_lock, 0]) / (peak_energy + 1e-12)
@@ -549,7 +551,9 @@ class PredominantLocalPulse:
         if self._bad_count >= self.reacquire_sec * fps:
             self._locked = False
             self.current_tempo = self._lock_bpm
-            self._confident_once = True
+            # Release switch inertia so _step_acquire can immediately leave the failed tempo
+            self._confident_once = False
+            self._active_acquire_frames = 0
             self._cand_bpm, self._cand_count = 0.0, 0
             self._chal_bpm, self._chal_count = 0.0, 0
             self._bad_count = 0.0
@@ -705,35 +709,29 @@ class ControlSignals:
 
     def calc_alpha_plp(self, buffer):
         norm_buffer = self.normalize_buffer(buffer)
-        alpha_plp = norm_buffer / self._alpha
-        return alpha_plp
+        return norm_buffer / self._alpha
 
     def calc_gamma_plp(self, buffer):
         alpha_plp = self.calc_alpha_plp(buffer)
         beta_envelope = self.calc_beta_envelope(buffer)
-
-        gamma_plp = np.divide(
+        return np.divide(
             alpha_plp,
             beta_envelope,
             out=np.zeros_like(alpha_plp),
-            where=(beta_envelope > 1e-8)
+            where=(beta_envelope > 1e-8),
         )
-        return gamma_plp
 
     def calc_beta_envelope(self, buffer):
         alpha_plp = self.calc_alpha_plp(buffer)
-        beta_envelope = np.abs(signal.hilbert(alpha_plp))
-        return beta_envelope
+        return np.abs(signal.hilbert(alpha_plp))
 
     def calc_gamma_envelope(self, buffer):
         beta_envelope = self.calc_beta_envelope(buffer)
-        gamma_envelope = self._alpha * beta_envelope
-        return gamma_envelope
+        return self._alpha * beta_envelope
 
     def calc_gamma_envelope2(self, buffer):
         norm_buffer = self.normalize_buffer(buffer)
-        gamma_envelope = np.abs(signal.hilbert(norm_buffer))
-        return gamma_envelope
+        return np.abs(signal.hilbert(norm_buffer))
 
 
 @dataclass
@@ -746,7 +744,7 @@ class RealTimeBeatTracker:
     cs: ControlSignals
 
     silence_db: float = -40.0
-    hold_frames: int = 30
+    hold_frames: int = 36
     mute_activation_when_inactive: bool = False
 
     _hold: int = field(default=0, init=False, repr=False)
@@ -772,8 +770,7 @@ class RealTimeBeatTracker:
         pulse_buffer = self.plp.process(tempogram_frame, self.active,
                                         self.tempogram._tempo_buffer, self.tempogram.win,
                                         self.tempogram.harm_frames)
-        beat_detected = self.plp.detect_beat(pulse_buffer)
-        return beat_detected
+        return self.plp.detect_beat(pulse_buffer)
 
     @classmethod
     def from_args(
@@ -785,27 +782,30 @@ class RealTimeBeatTracker:
         Theta=np.arange(90, 180, 1),
         lookahead=0,
         silence_db=-40.0,
-        hold_frames=30,
+        hold_frames=36,
         conf_threshold=1.6,
+        lock_conf_threshold=1.8,
         switch_ratio=1.3,
         energy_threshold=0.05,
         lock_enable=True,
-        lock_sec=3.0,
-        lock_tol_bpm=4.0,
+        lock_sec=2.0,
+        lock_tol_bpm=3.0,
         lose_rho=0.5,
         lose_conf=1.15,
         lose_err=0.4,
         phase_gate=0.25,
-        reacquire_sec=3.5,
+        reacquire_sec=3.0,
         pll_tau_sec=1.5,
         pll_conf_hi=3.0,
-        switch_persist_sec=2.0,
-        harmonic_weight=0.5,
-        relock_sec=3.0,
+        switch_persist_sec=1.5,
+        harmonic_weight=0.0,
+        acquire_min_active_sec=2.0,
+        relock_sec=2.5,
         relock_coh=0.55,
         relock_min_w=0.15,
-        resume_gate_sec=2.0,
-        silence_reopen_sec=2.0,
+        resume_gate_sec=3.0,
+        silence_reopen_sec=1.5,
+        resume_gain=3.0,
         activation=None,
         mute_activation_when_inactive=None,
     ):
@@ -822,6 +822,7 @@ class RealTimeBeatTracker:
             Theta=Theta,
             lookahead=lookahead,
             conf_threshold=conf_threshold,
+            lock_conf_threshold=lock_conf_threshold,
             switch_ratio=switch_ratio,
             energy_threshold=energy_threshold,
             lock_enable=lock_enable,
@@ -836,11 +837,13 @@ class RealTimeBeatTracker:
             pll_conf_hi=pll_conf_hi,
             switch_persist_sec=switch_persist_sec,
             harmonic_weight=harmonic_weight,
+            acquire_min_active_sec=acquire_min_active_sec,
             relock_sec=relock_sec,
             relock_coh=relock_coh,
             relock_min_w=relock_min_w,
             resume_gate_sec=resume_gate_sec,
             silence_reopen_sec=silence_reopen_sec,
+            resume_gain=resume_gain,
         )
         cs = ControlSignals(plp=pulse)
         return cls(
